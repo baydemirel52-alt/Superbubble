@@ -54,16 +54,20 @@ class BubbleService : NotificationListenerService() {
             "com.instagram.android"
         )
 
-        // Mesaj Durum Kodları
-        const val STATUS_SENT = 1      // ✓ (Gönderildi)
-        const val STATUS_DELIVERED = 2 // ✓✓ Gri (İletildi)
-        const val STATUS_READ = 3      // ✓✓ Mavi / Görüldü (Okundu)
+        // Gerçek Mesaj Durum Kodları
+        const val STATUS_SENDING = 0   // 🕒 (Gönderiliyor)
+        const val STATUS_SENT = 1      // ✓ Tek Gri Tik (Sunucuya Gönderildi - Karşı tarafın interneti kapalı olabilir)
+        const val STATUS_DELIVERED = 2 // ✓✓ Çift Gri Tik (Karşı cihaza İletildi)
+        const val STATUS_READ = 3      // ✓✓ Çift Mavi Tik / Görüldü (Karşı taraf okudu)
 
         var instance: BubbleService? = null
 
-        // Instagram'da sohbet açılınca otomatik arama tuşuna basmak için geçici emir
         var pendingInstaCallVideo: Boolean? = null
         var pendingInstaCallTimestamp: Long = 0L
+
+        // Canlı Tik ve Çevrimiçi/Son Görülme Yoklaması
+        var pendingQuickSync: Boolean = false
+        var pendingQuickSyncTimestamp: Long = 0L
 
         fun spawnTestBubble(context: Context) {
             val srv = instance
@@ -83,7 +87,7 @@ class BubbleService : NotificationListenerService() {
                     sender = "Test Sohbeti",
                     messagesBatch = listOf(
                         ChatMessage(
-                            text = "Kanka şimdi bir mesaj yaz, tiklerin (✓ -> ✓✓ -> Mavi ✓✓) nasıl değiştiğini canlı gör!",
+                            text = "Kanka sahte çift tik kaldırıldı! Üstteki 🔄 tuşuyla gerçek tik ve son görülme yoklaması yapabilirsin.",
                             isMe = false,
                             time = srv.nowTime(),
                             status = STATUS_READ
@@ -107,7 +111,7 @@ class BubbleService : NotificationListenerService() {
         val time: String,
         var imageBase64: String? = null,
         val audioUri: String? = null,
-        var status: Int = STATUS_DELIVERED // 1: Gönderildi, 2: İletildi, 3: Okundu/Görüldü
+        var status: Int = STATUS_SENT
     )
 
     data class ChatSession(
@@ -122,6 +126,7 @@ class BubbleService : NotificationListenerService() {
         var contentIntent: PendingIntent? = null,
         var callIntent: PendingIntent? = null,
         var isIncomingCall: Boolean = false,
+        var presenceStatus: String? = null, // "çevrimiçi", "son görülme...", "yazıyor...", "Şu anda aktif"
         var unreadCount: Int = 0
     )
 
@@ -266,11 +271,11 @@ class BubbleService : NotificationListenerService() {
             return
         }
 
-        // ==================== 2. GÖNDERİLEN MESAJIN İLETİLDİ (✓✓) ONAYI ====================
+        // ==================== 2. GÖNDERİLEN MESAJ YANSIMASI (SAHTE ÇİFT TİK YAPMAZ!) ====================
         val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
         if (!remoteHistory.isNullOrEmpty()) {
-            // WhatsApp/Instagram mesajı sunucuya ilettiğini onayladı -> Çift Gri Tik (✓✓) yap!
-            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
+            // Bu sadece bizim yazdığımız cevabın bildirim yansımasıdır; karşı tarafa iletildiği anlamına GELMEZ!
+            // O yüzden STATUS_DELIVERED yapmıyoruz, sadece üstteki yansıma bildirimini temizliyoruz.
             scheduleCancelNotification(sbn.key, 350)
             return
         }
@@ -309,7 +314,6 @@ class BubbleService : NotificationListenerService() {
                         (selfName != null && lastSender.equals(selfName, true))
                     )
             ) {
-                markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
                 scheduleCancelNotification(sbn.key, 350)
                 return
             }
@@ -346,7 +350,7 @@ class BubbleService : NotificationListenerService() {
                         time = nowTime(),
                         imageBase64 = bitmapToBase64(itemBmp),
                         audioUri = itemAudio,
-                        status = STATUS_READ
+                        status = if (isFromMe) STATUS_SENT else STATUS_READ
                     )
                 )
             }
@@ -356,7 +360,6 @@ class BubbleService : NotificationListenerService() {
         }
 
         if (text.startsWith("Siz:") || text.startsWith("Sen:") || text.startsWith("You:")) {
-            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
             scheduleCancelNotification(sbn.key, 350)
             return
         }
@@ -364,7 +367,6 @@ class BubbleService : NotificationListenerService() {
         val now = System.currentTimeMillis()
         recentSentTexts.entries.removeIf { now - it.value > 15000 }
         if (recentSentTexts.containsKey(text)) {
-            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
             scheduleCancelNotification(sbn.key, 350)
             return
         }
@@ -424,30 +426,11 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // Mesajların tik / görüldü durumunu günceller
-    fun markSessionMessagesStatus(chatKey: String, newStatus: Int) {
-        mainHandler.post {
-            val sess = activeSessions[chatKey] ?: return@post
-            var changed = false
-            for (m in sess.messages) {
-                if (m.isMe && m.status < newStatus) {
-                    m.status = newStatus
-                    changed = true
-                }
-            }
-            if (changed) {
-                saveMessagesToDisk(chatKey, sess.messages)
-                if (isExpanded && activeChatKey == chatKey) {
-                    refreshExpandedUI()
-                }
-            }
-        }
-    }
-
-    // Uygulama içi ekrandan (ChatSyncService) okunan mesajları ve Mavi Tik / Görüldü bilgisini eşitler
+    // ==================== GERÇEK TİK VE ÇEVRİMİÇİ / SON GÖRÜLME EŞİTLEME ====================
     fun syncFromAppScreen(
         pkgName: String,
         title: String,
+        presenceText: String?,
         screenMessages: List<Triple<String, Boolean, Int>>
     ) {
         val cleanTitle = title.trim()
@@ -456,6 +439,7 @@ class BubbleService : NotificationListenerService() {
         val chatKey = "${pkgName}_${cleanTitle.lowercase(Locale.getDefault())}"
 
         mainHandler.post {
+            // Eğer başka bir ön-isimle ("test_messenger" dışındaki boş kafa) açılmışsa birleştir
             val session = activeSessions.getOrPut(chatKey) {
                 ChatSession(
                     key = chatKey,
@@ -467,11 +451,16 @@ class BubbleService : NotificationListenerService() {
             }
 
             var changed = false
-            for ((msgText, isMe, detectedStatus) in screenMessages) {
+            if (!presenceText.isNullOrBlank() && session.presenceStatus != presenceText) {
+                session.presenceStatus = presenceText
+                changed = true
+            }
+
+            for ((msgText, isMe, realTickStatus) in screenMessages) {
                 val existing = session.messages.findLast { it.text == msgText && it.isMe == isMe }
                 if (existing != null) {
-                    if (isMe && detectedStatus > existing.status) {
-                        existing.status = detectedStatus
+                    if (isMe && existing.status != realTickStatus) {
+                        existing.status = realTickStatus
                         changed = true
                     }
                 } else {
@@ -480,7 +469,7 @@ class BubbleService : NotificationListenerService() {
                             text = msgText,
                             isMe = isMe,
                             time = nowTime(),
-                            status = detectedStatus
+                            status = realTickStatus
                         )
                     )
                     changed = true
@@ -494,6 +483,31 @@ class BubbleService : NotificationListenerService() {
                 }
             }
         }
+    }
+
+    fun reopenAfterQuickSync() {
+        mainHandler.postDelayed({
+            if (!isExpanded && activeSessions.isNotEmpty()) {
+                openExpandedChat()
+                Toast.makeText(this, "✅ Tikler ve Son Görülme güncellendi!", Toast.LENGTH_SHORT).show()
+            }
+        }, 350)
+    }
+
+    private fun triggerQuickLiveSync() {
+        if (activeChatKey == "test_messenger") {
+            val active = activeSessions[activeChatKey] ?: return
+            active.presenceStatus = "çevrimiçi"
+            active.messages.forEach { if (it.isMe) it.status = STATUS_READ }
+            refreshExpandedUI()
+            Toast.makeText(this, "Test: Durum 'çevrimiçi' ve Mavi Tik yapıldı!", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        pendingQuickSync = true
+        pendingQuickSyncTimestamp = System.currentTimeMillis()
+        Toast.makeText(this, "🔄 Gerçek tik ve son görülme yoklanıyor...", Toast.LENGTH_SHORT).show()
+        openOriginalApp()
     }
 
     private fun isIncomingCallText(txt: String): Boolean {
@@ -514,7 +528,6 @@ class BubbleService : NotificationListenerService() {
         return notif.actions?.lastOrNull()?.actionIntent
     }
 
-    // S22 Ultra (Android 14/15/16) Arka Plan PendingIntent Engelini Aşan Fonksiyon!
     private fun sendPendingIntentSafely(pi: PendingIntent?): Boolean {
         if (pi == null) return false
         return try {
@@ -534,11 +547,9 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== WHATSAPP & INSTAGRAM SESLİ / GÖRÜNTÜLÜ ARAMA BAŞLATMA ====================
     private fun initiateCall(isVideo: Boolean) {
         val active = activeSessions[activeChatKey] ?: return
 
-        // 1. Eğer o an çalan bir arama varsa direkt aramaya gir
         if (active.isIncomingCall && active.callIntent != null) {
             if (sendPendingIntentSafely(active.callIntent)) {
                 collapseChat()
@@ -546,7 +557,6 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        // 2. WhatsApp ise doğrudan Rehber (ContactsContract) üzerinden aramayı başlat
         if (active.pkgName.contains("whatsapp") &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
         ) {
@@ -571,8 +581,6 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        // 3. Instagram (veya rehberde kayıtlı olmayan WhatsApp kişisi) için:
-        // Otomatik arama emrini kur, S22 Ultra izniyle direkt DM sohbetini aç ve arama ikonuna otomatik tıkla!
         if (active.pkgName.contains("instagram")) {
             pendingInstaCallVideo = isVideo
             pendingInstaCallTimestamp = System.currentTimeMillis()
@@ -615,7 +623,7 @@ class BubbleService : NotificationListenerService() {
     }
 
     private fun createMessengerVectorIcon(isVideo: Boolean, onClick: () -> Unit): ImageView {
-        val sizePx = dpToPx(36)
+        val sizePx = dpToPx(34)
         val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -659,7 +667,7 @@ class BubbleService : NotificationListenerService() {
 
         return ImageView(this).apply {
             layoutParams = LinearLayout.LayoutParams(sizePx, sizePx).apply {
-                rightMargin = dpToPx(6)
+                rightMargin = dpToPx(5)
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -838,7 +846,7 @@ class BubbleService : NotificationListenerService() {
                         time = obj.optString("time", ""),
                         imageBase64 = obj.optString("img", "").ifEmpty { null },
                         audioUri = obj.optString("aud", "").ifEmpty { null },
-                        status = obj.optInt("st", STATUS_DELIVERED)
+                        status = obj.optInt("st", STATUS_SENT)
                     )
                 )
             }
@@ -951,14 +959,9 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        // Karşı taraf bize yeni mesaj attıysa önceki tüm gönderdiğimiz mesajları OKUNDU (Mavi ✓✓ / Görüldü) yap!
+        // Karşı taraf o an yeni bir mesaj gönderdiyse o an çevrimiçidir
         if (hasIncomingFromOther) {
-            for (m in session.messages) {
-                if (m.isMe && m.status < STATUS_READ) {
-                    m.status = STATUS_READ
-                    addedNew = true
-                }
-            }
+            session.presenceStatus = if (appName == "Instagram") "Şu anda aktif" else "çevrimiçi"
         }
 
         if (addedNew) {
@@ -1220,7 +1223,7 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ ====================
+    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ (KLAVYE TAŞMASI DÜZELTİLDİ) ====================
     private fun openExpandedChat() {
         if (isExpanded || activeSessions.isEmpty()) return
         isExpanded = true
@@ -1238,1187 +1241,3 @@ class BubbleService : NotificationListenerService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             dimAmount = 0.55f
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-        }
-
-        expandedOverlayView = object : FrameLayout(this) {
-            override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
-                if (event?.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-                    if (fullScreenImageOverlay?.visibility == View.VISIBLE) {
-                        fullScreenImageOverlay?.visibility = View.GONE
-                        return true
-                    }
-                    if (extraToolPanel?.visibility == View.VISIBLE) {
-                        extraToolPanel?.visibility = View.GONE
-                        return true
-                    }
-                    collapseChat()
-                    return true
-                }
-                return super.dispatchKeyEvent(event)
-            }
-        }.apply {
-            setOnClickListener { collapseChat() }
-        }
-
-        val cardWidth = if (isLandscape) {
-            min(dpToPx(440), (metrics.widthPixels * 0.65f).toInt())
-        } else {
-            WindowManager.LayoutParams.MATCH_PARENT
-        }
-
-        val cardHeight = if (isLandscape) {
-            (metrics.heightPixels * 0.74f).toInt()
-        } else {
-            (metrics.heightPixels * 0.50f).toInt()
-        }
-
-        val mainColumn = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = FrameLayout.LayoutParams(
-                cardWidth,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply {
-                topMargin = if (isLandscape) dpToPx(8) else dpToPx(34)
-                if (!isLandscape) {
-                    leftMargin = dpToPx(12)
-                    rightMargin = dpToPx(12)
-                }
-            }
-            isClickable = true
-        }
-
-        // --- ÜST BÖLÜM ---
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                if (isLandscape) dpToPx(46) else dpToPx(58)
-            ).apply { bottomMargin = dpToPx(6) }
-        }
-
-        topHeadsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-
-        val minimizePill = TextView(this).apply {
-            text = "Küçült ⬇"
-            textSize = 12.5f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#3A3B3C"))
-                cornerRadius = dpToPx(18).toFloat()
-            }
-            setOnClickListener { collapseChat() }
-        }
-
-        val closeAllPill = TextView(this).apply {
-            text = "✕"
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            val btnSize = if (isLandscape) dpToPx(34) else dpToPx(38)
-            layoutParams = LinearLayout.LayoutParams(btnSize, btnSize).apply {
-                leftMargin = dpToPx(8)
-            }
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#FF3B30"))
-            }
-            setOnClickListener {
-                activeSessions.clear()
-                destroyAllOverlays()
-            }
-        }
-
-        topBar.addView(topHeadsContainer)
-        topBar.addView(minimizePill)
-        topBar.addView(closeAllPill)
-
-        // --- ORTA BÖLÜM: SOHBET KARTI ---
-        val chatCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                cardHeight
-            )
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#18191A"))
-                cornerRadius = dpToPx(22).toFloat()
-                setStroke(dpToPx(1), Color.parseColor("#3E4042"))
-            }
-            elevation = dpToPx(12).toFloat()
-        }
-
-        val vPad = if (isLandscape) dpToPx(6) else dpToPx(10)
-        val cardHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpToPx(12), vPad, dpToPx(12), vPad)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#242526"))
-                cornerRadii = floatArrayOf(
-                    dpToPx(22).toFloat(), dpToPx(22).toFloat(),
-                    dpToPx(22).toFloat(), dpToPx(22).toFloat(),
-                    0f, 0f, 0f, 0f
-                )
-            }
-        }
-
-        val avSize = if (isLandscape) dpToPx(34) else dpToPx(40)
-        val headerAvatarBox = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(avSize, avSize)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#0084FF"))
-            }
-            setOnClickListener { openOriginalApp() }
-        }
-
-        headerInitialsTxt = TextView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            gravity = Gravity.CENTER
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-        }
-
-        headerAvatarImg = ImageView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(avSize, avSize)
-            scaleType = ImageView.ScaleType.CENTER_CROP
-        }
-
-        headerAvatarBox.addView(headerInitialsTxt)
-        headerAvatarBox.addView(headerAvatarImg)
-
-        val titleCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                leftMargin = dpToPx(10)
-            }
-            setOnClickListener { openOriginalApp() }
-        }
-
-        headerNameTxt = TextView(this).apply {
-            textSize = if (isLandscape) 14f else 15f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            maxLines = 1
-        }
-
-        headerSubTxt = TextView(this).apply {
-            textSize = 11f
-            setTextColor(Color.parseColor("#00A884"))
-        }
-
-        titleCol.addView(headerNameTxt)
-        titleCol.addView(headerSubTxt)
-
-        val voiceCallIcon = createMessengerVectorIcon(isVideo = false) {
-            initiateCall(isVideo = false)
-        }
-
-        val videoCallIcon = createMessengerVectorIcon(isVideo = true) {
-            initiateCall(isVideo = true)
-        }
-
-        val openAppBtn = TextView(this).apply {
-            text = "↗"
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.parseColor("#4599FF"))
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(34), dpToPx(34))
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#263951"))
-            }
-            setOnClickListener { openOriginalApp() }
-        }
-
-        cardHeader.addView(headerAvatarBox)
-        cardHeader.addView(titleCol)
-        cardHeader.addView(voiceCallIcon)
-        cardHeader.addView(videoCallIcon)
-        cardHeader.addView(openAppBtn)
-
-        incomingCallBanner = TextView(this).apply {
-            text = "📞 GELEN ARAMA VAR • Katılmak İçin Dokun"
-            textSize = 13f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
-            setBackgroundColor(Color.parseColor("#00C853"))
-            visibility = View.GONE
-            setOnClickListener {
-                val active = activeSessions[activeChatKey]
-                if (!sendPendingIntentSafely(active?.callIntent) && !sendPendingIntentSafely(active?.contentIntent)) {
-                    openOriginalApp()
-                } else {
-                    active?.isIncomingCall = false
-                    collapseChat()
-                }
-            }
-        }
-
-        messagesScroll = ScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
-        }
-
-        messagesContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-        messagesScroll?.addView(messagesContainer)
-
-        extraToolPanel = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-            setBackgroundColor(Color.parseColor("#202124"))
-            visibility = View.GONE
-        }
-
-        val inputBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpToPx(8), vPad, dpToPx(8), vPad)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#242526"))
-                cornerRadii = floatArrayOf(
-                    0f, 0f, 0f, 0f,
-                    dpToPx(22).toFloat(), dpToPx(22).toFloat(),
-                    dpToPx(22).toFloat(), dpToPx(22).toFloat()
-                )
-            }
-        }
-
-        val emojiBtn = createActionIconButton("😀") { toggleEmojiPanel() }
-        val photoBtn = createActionIconButton("📷") { togglePhotoPickerPanel() }
-
-        replyEdit = EditText(this).apply {
-            val h = if (isLandscape) dpToPx(38) else dpToPx(42)
-            layoutParams = LinearLayout.LayoutParams(0, h, 1f).apply {
-                leftMargin = dpToPx(4)
-                rightMargin = dpToPx(4)
-            }
-            hint = "Mesaj yaz..."
-            setHintTextColor(Color.parseColor("#8A8D91"))
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_SEND
-            setPadding(dpToPx(14), 0, dpToPx(14), 0)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#3A3B3C"))
-                cornerRadius = dpToPx(21).toFloat()
-            }
-            setOnEditorActionListener { _, actionId, _ ->
-                if (actionId == EditorInfo.IME_ACTION_SEND) {
-                    sendMessageNow()
-                    true
-                } else false
-            }
-        }
-
-        val voiceBtn = createActionIconButton("🎤") { toggleVoicePanel() }
-
-        val sendCircleBtn = TextView(this).apply {
-            text = "➤"
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            val s = if (isLandscape) dpToPx(38) else dpToPx(42)
-            layoutParams = LinearLayout.LayoutParams(s, s).apply {
-                leftMargin = dpToPx(4)
-            }
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#0084FF"))
-            }
-            setOnClickListener { sendMessageNow() }
-        }
-
-        inputBar.addView(emojiBtn)
-        inputBar.addView(photoBtn)
-        inputBar.addView(replyEdit)
-        inputBar.addView(voiceBtn)
-        inputBar.addView(sendCircleBtn)
-
-        chatCard.addView(cardHeader)
-        chatCard.addView(incomingCallBanner)
-        chatCard.addView(messagesScroll)
-        chatCard.addView(extraToolPanel)
-        chatCard.addView(inputBar)
-
-        mainColumn.addView(topBar)
-        mainColumn.addView(chatCard)
-
-        fullScreenImageOverlay = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-            setBackgroundColor(Color.parseColor("#EE000000"))
-            visibility = View.GONE
-            setOnClickListener { visibility = View.GONE }
-        }
-
-        expandedOverlayView?.addView(mainColumn)
-        expandedOverlayView?.addView(fullScreenImageOverlay)
-
-        windowManager.addView(expandedOverlayView, expandedParams)
-        refreshExpandedUI()
-    }
-
-    private fun createActionIconButton(symbol: String, onClick: () -> Unit): TextView {
-        return TextView(this).apply {
-            text = symbol
-            textSize = 17f
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(36), dpToPx(36)).apply {
-                rightMargin = dpToPx(2)
-            }
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#3A3B3C"))
-            }
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun toggleEmojiPanel() {
-        val panel = extraToolPanel ?: return
-        if (panel.visibility == View.VISIBLE && panel.tag == "EMOJI") {
-            panel.visibility = View.GONE
-            return
-        }
-        panel.removeAllViews()
-        panel.tag = "EMOJI"
-
-        val emojis = listOf(
-            "😂", "❤️", "👍", "🔥", "😍", "🙏", "😭", "😎",
-            "🤔", "👏", "🎉", "💯", "🥰", "🤣", "😅", "👌",
-            "💪", "🙌", "😘", "👀", "😡", "😱", "🌹", "✨"
-        )
-
-        val scroll = HorizontalScrollView(this).apply {
-            setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
-        }
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-
-        emojis.forEach { emo ->
-            val tv = TextView(this).apply {
-                text = emo
-                textSize = 22f
-                setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
-                setOnClickListener { replyEdit?.append(emo) }
-            }
-            row.addView(tv)
-        }
-
-        scroll.addView(row)
-        panel.addView(scroll)
-        panel.visibility = View.VISIBLE
-    }
-
-    private fun togglePhotoPickerPanel() {
-        val panel = extraToolPanel ?: return
-        if (panel.visibility == View.VISIBLE && panel.tag == "PHOTO") {
-            panel.visibility = View.GONE
-            return
-        }
-        panel.removeAllViews()
-        panel.tag = "PHOTO"
-
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
-        }
-
-        val recentUris = getRecentGalleryPhotos(10)
-        if (recentUris.isEmpty()) {
-            val info = TextView(this).apply {
-                text = "Galeriden fotoğraf seçmek için SuperBubble ana ekranından 3. İzin butonuna bas kanka."
-                textSize = 12f
-                setTextColor(Color.LTGRAY)
-            }
-            container.addView(info)
-        } else {
-            val hint = TextView(this).apply {
-                text = "📷 Göndermek istediğin fotoğrafa dokun:"
-                textSize = 11.5f
-                setTextColor(Color.LTGRAY)
-                setPadding(0, 0, 0, dpToPx(6))
-            }
-            container.addView(hint)
-
-            val hScroll = HorizontalScrollView(this)
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-
-            recentUris.forEach { uri ->
-                val bmp = loadBitmapFromUri(uri)
-                if (bmp != null) {
-                    val img = ImageView(this).apply {
-                        layoutParams = LinearLayout.LayoutParams(dpToPx(68), dpToPx(68)).apply {
-                            rightMargin = dpToPx(8)
-                        }
-                        scaleType = ImageView.ScaleType.CENTER_CROP
-                        setImageBitmap(bmp)
-                        setOnClickListener { sharePhotoToActiveApp(uri) }
-                    }
-                    row.addView(img)
-                }
-            }
-            hScroll.addView(row)
-            container.addView(hScroll)
-        }
-
-        panel.addView(container)
-        panel.visibility = View.VISIBLE
-    }
-
-    private fun sharePhotoToActiveApp(uri: Uri) {
-        val active = activeSessions[activeChatKey] ?: return
-        try {
-            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/*"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                setPackage(active.pkgName)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            collapseChat()
-            startActivity(shareIntent)
-        } catch (_: Exception) {
-            openOriginalApp()
-        }
-    }
-
-    private fun toggleVoicePanel() {
-        val panel = extraToolPanel ?: return
-        if (panel.visibility == View.VISIBLE && panel.tag == "VOICE") {
-            panel.visibility = View.GONE
-            return
-        }
-        panel.removeAllViews()
-        panel.tag = "VOICE"
-
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
-        }
-
-        val voiceToTextBtn = TextView(this).apply {
-            text = "🎙️ Konuşarak Yazdır"
-            textSize = 12.5f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                rightMargin = dpToPx(6)
-            }
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#0084FF"))
-                cornerRadius = dpToPx(14).toFloat()
-            }
-            setOnClickListener { startVoiceDictation() }
-        }
-
-        val directVoiceNoteBtn = TextView(this).apply {
-            text = "🔊 Ses Kaydı At ↗"
-            textSize = 12.5f
-            setTypeface(null, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#00A884"))
-                cornerRadius = dpToPx(14).toFloat()
-            }
-            setOnClickListener { openOriginalApp() }
-        }
-
-        row.addView(voiceToTextBtn)
-        row.addView(directVoiceNoteBtn)
-        panel.addView(row)
-        panel.visibility = View.VISIBLE
-    }
-
-    private fun startVoiceDictation() {
-        replyEdit?.requestFocus()
-        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.showSoftInput(replyEdit, InputMethodManager.SHOW_IMPLICIT)
-        Toast.makeText(
-            this,
-            "Klavyenin üstündeki mikrofon 🎙️ simgesine basıp konuş kanka!",
-            Toast.LENGTH_SHORT
-        ).show()
-    }
-
-    private fun showFullScreenPhoto(bmp: Bitmap) {
-        fullScreenImageOverlay?.removeAllViews()
-        val img = ImageView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                Gravity.CENTER
-            ).apply {
-                val m = dpToPx(20)
-                setMargins(m, m, m, m)
-            }
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            setImageBitmap(bmp)
-        }
-        val closeHint = TextView(this).apply {
-            text = "✕ Kapatmak için dokun"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply { topMargin = dpToPx(30) }
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#AA333333"))
-                cornerRadius = dpToPx(20).toFloat()
-            }
-        }
-        fullScreenImageOverlay?.addView(img)
-        fullScreenImageOverlay?.addView(closeHint)
-        fullScreenImageOverlay?.visibility = View.VISIBLE
-    }
-
-    // S22 Ultra'da hem PendingIntent hem de doğrudan Paket Açma garantili uygulama başlatıcı
-    private fun openOriginalApp() {
-        val active = activeSessions[activeChatKey] ?: return
-        collapseChat()
-
-        // 1. Gelen arama varsa direkt çağrı ekranını aç
-        if (active.isIncomingCall && sendPendingIntentSafely(active.callIntent)) {
-            return
-        }
-
-        // 2. Bildirimin kendi sohbet bağlantısını S22 Ultra izniyle aç
-        if (sendPendingIntentSafely(active.contentIntent)) {
-            return
-        }
-
-        // 3. Eğer bildirim bağlantısı düşmüşse doğrudan Instagram DM / WhatsApp uygulamasını başlat
-        try {
-            if (active.pkgName.contains("instagram")) {
-                val dmIntent = Intent(Intent.ACTION_VIEW, Uri.parse("instagram://direct-inbox")).apply {
-                    setPackage(active.pkgName)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                startActivity(dmIntent)
-                return
-            }
-        } catch (_: Exception) {}
-
-        try {
-            val launchIntent = packageManager.getLaunchIntentForPackage(active.pkgName)?.apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            if (launchIntent != null) {
-                startActivity(launchIntent)
-            }
-        } catch (_: Exception) {
-            Toast.makeText(this, "Uygulama açılamadı kanka.", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun playOrToggleAudio(uriStr: String) {
-        try {
-            if (mediaPlayer?.isPlaying == true) {
-                stopAudio()
-                Toast.makeText(this, "Ses durduruldu", Toast.LENGTH_SHORT).show()
-                return
-            }
-            stopAudio()
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(this@BubbleService, Uri.parse(uriStr))
-                prepare()
-                start()
-                setOnCompletionListener { stopAudio() }
-            }
-            Toast.makeText(this, "🔊 Ses kaydı çalıyor...", Toast.LENGTH_SHORT).show()
-        } catch (_: Exception) {
-            openOriginalApp()
-        }
-    }
-
-    private fun stopAudio() {
-        try {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-        } catch (_: Exception) {}
-        mediaPlayer = null
-    }
-
-    private fun isPhotoMessageText(txt: String): Boolean {
-        val lower = txt.lowercase(Locale.getDefault())
-        return lower.contains("📷") || lower.contains("fotoğraf") || lower.contains("photo") || lower.contains("resim") || lower.contains("görsel")
-    }
-
-    private fun isVoiceMessageText(txt: String): Boolean {
-        val lower = txt.lowercase(Locale.getDefault())
-        return lower.contains("🎤") || lower.contains("sesli mesaj") || lower.contains("voice message") || lower.contains("ses gönderdi")
-    }
-
-    private fun isReelOrVideoText(txt: String): Boolean {
-        val lower = txt.lowercase(Locale.getDefault())
-        return lower.contains("reel") || lower.contains("video gönderdi") ||
-                lower.contains("instagram.com/reel") || lower.contains("bir gönderi paylaştı")
-    }
-
-    private fun refreshExpandedUI() {
-        if (!isExpanded || expandedOverlayView == null) return
-
-        val active = activeSessions[activeChatKey] ?: activeSessions.values.firstOrNull() ?: return
-        activeChatKey = active.key
-        active.unreadCount = 0
-
-        if (!active.isIncomingCall) {
-            scheduleCancelNotification(active.sbnKey, 150)
-        }
-
-        val isLandscape = resources.displayMetrics.widthPixels > resources.displayMetrics.heightPixels
-        val headDim = if (isLandscape) dpToPx(42) else dpToPx(52)
-
-        topHeadsContainer?.removeAllViews()
-        activeSessions.values.forEach { sess ->
-            val isSelected = sess.key == activeChatKey
-            val headFrame = FrameLayout(this).apply {
-                layoutParams = LinearLayout.LayoutParams(headDim, headDim).apply {
-                    rightMargin = dpToPx(8)
-                }
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor(if (sess.isIncomingCall) "#00C853" else "#0084FF"))
-                    setStroke(dpToPx(if (isSelected) 3 else 1), if (isSelected) Color.WHITE else Color.GRAY)
-                }
-                setOnClickListener {
-                    if (sess.key == activeChatKey) {
-                        collapseChat()
-                    } else {
-                        activeChatKey = sess.key
-                        sess.unreadCount = 0
-                        refreshExpandedUI()
-                    }
-                }
-            }
-
-            if (sess.avatar != null) {
-                val img = ImageView(this).apply {
-                    layoutParams = FrameLayout.LayoutParams(headDim - dpToPx(4), headDim - dpToPx(4), Gravity.CENTER)
-                    setImageBitmap(sess.avatar)
-                }
-                headFrame.addView(img)
-            } else {
-                val txt = TextView(this).apply {
-                    layoutParams = FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT
-                    )
-                    gravity = Gravity.CENTER
-                    text = sess.sender.take(1).uppercase()
-                    textSize = 15f
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                }
-                headFrame.addView(txt)
-            }
-
-            topHeadsContainer?.addView(headFrame)
-        }
-
-        if (active.avatar != null) {
-            headerAvatarImg?.setImageBitmap(active.avatar)
-            headerAvatarImg?.visibility = View.VISIBLE
-            headerInitialsTxt?.visibility = View.GONE
-        } else {
-            headerAvatarImg?.visibility = View.GONE
-            headerInitialsTxt?.visibility = View.VISIBLE
-            headerInitialsTxt?.text = active.sender.take(1).uppercase()
-        }
-
-        val isInsta = active.appName == "Instagram"
-        headerNameTxt?.text = active.sender
-        headerSubTxt?.text = if (active.isIncomingCall) "📞 Gelen Arama..." else active.appName
-        headerSubTxt?.setTextColor(
-            Color.parseColor(if (isInsta) "#E1306C" else "#25D366")
-        )
-
-        incomingCallBanner?.visibility = if (active.isIncomingCall) View.VISIBLE else View.GONE
-
-        messagesContainer?.removeAllViews()
-        val lastMyMsgIndex = active.messages.indexOfLast { it.isMe }
-
-        active.messages.forEachIndexed { index, msg ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dpToPx(5) }
-                gravity = if (msg.isMe) Gravity.END else Gravity.START
-            }
-
-            val bubbleBox = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
-                background = GradientDrawable().apply {
-                    setColor(Color.parseColor(if (msg.isMe) "#0084FF" else "#303030"))
-                    cornerRadius = dpToPx(18).toFloat()
-                }
-            }
-
-            val bmp = base64ToBitmap(msg.imageBase64)
-            if (bmp != null) {
-                val photoView = ImageView(this).apply {
-                    layoutParams = LinearLayout.LayoutParams(dpToPx(200), dpToPx(135)).apply {
-                        bottomMargin = dpToPx(6)
-                    }
-                    scaleType = ImageView.ScaleType.CENTER_CROP
-                    setImageBitmap(bmp)
-                    setOnClickListener { showFullScreenPhoto(bmp) }
-                }
-                bubbleBox.addView(photoView)
-            } else if (!msg.isMe && isPhotoMessageText(msg.text)) {
-                val openPhotoBtn = TextView(this).apply {
-                    text = "📷 Fotoğrafı Gör ↗"
-                    textSize = 12.5f
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                    setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { bottomMargin = dpToPx(6) }
-                    background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#0084FF"))
-                        cornerRadius = dpToPx(14).toFloat()
-                    }
-                    setOnClickListener { openOriginalApp() }
-                }
-                bubbleBox.addView(openPhotoBtn)
-            }
-
-            val msgTxt = TextView(this).apply {
-                text = msg.text
-                textSize = 14f
-                setTextColor(Color.WHITE)
-                maxWidth = dpToPx(240)
-            }
-            bubbleBox.addView(msgTxt)
-
-            if (msg.audioUri != null || isVoiceMessageText(msg.text)) {
-                val audioBtn = TextView(this).apply {
-                    text = if (msg.audioUri != null) "▶️ Ses Kaydını Dinle" else "🎤 Ses Kaydını Aç ↗"
-                    textSize = 12.5f
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                    setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { topMargin = dpToPx(6) }
-                    background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#00A884"))
-                        cornerRadius = dpToPx(14).toFloat()
-                    }
-                    setOnClickListener {
-                        if (msg.audioUri != null) playOrToggleAudio(msg.audioUri) else openOriginalApp()
-                    }
-                }
-                bubbleBox.addView(audioBtn)
-            } else if (isReelOrVideoText(msg.text)) {
-                val reelBtn = TextView(this).apply {
-                    text = "🎬 Reels / Videoyu İzle ↗"
-                    textSize = 12.5f
-                    setTypeface(null, Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                    setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { topMargin = dpToPx(6) }
-                    background = GradientDrawable().apply {
-                        setColor(Color.parseColor("#E1306C"))
-                        cornerRadius = dpToPx(14).toFloat()
-                    }
-                    setOnClickListener { openOriginalApp() }
-                }
-                bubbleBox.addView(reelBtn)
-            }
-
-            // ==================== SAAT + WHATSAPP TİKLERİ (✓, ✓✓, Mavi ✓✓) & INSTAGRAM "GÖRÜLDÜ" ====================
-            val metaRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-                setPadding(dpToPx(6), dpToPx(2), dpToPx(6), 0)
-            }
-
-            val timeTxt = TextView(this).apply {
-                text = msg.time
-                textSize = 10f
-                setTextColor(Color.parseColor("#8A8D91"))
-            }
-            metaRow.addView(timeTxt)
-
-            if (msg.isMe) {
-                if (isInsta) {
-                    // Instagram tarzı: Son gönderilen mesajın altında Gönderildi / İletildi / Görüldü yazar
-                    if (index == lastMyMsgIndex) {
-                        val igStatusTxt = TextView(this).apply {
-                            text = when (msg.status) {
-                                STATUS_SENT -> "  • Gönderildi"
-                                STATUS_DELIVERED -> "  • İletildi"
-                                else -> "  • Görüldü 👀"
-                            }
-                            textSize = 10.5f
-                            setTypeface(null, if (msg.status == STATUS_READ) Typeface.BOLD else Typeface.NORMAL)
-                            setTextColor(
-                                Color.parseColor(if (msg.status == STATUS_READ) "#53BDEB" else "#9EA2A8")
-                            )
-                        }
-                        metaRow.addView(igStatusTxt)
-                    }
-                } else {
-                    // WhatsApp tarzı: Her mesajın yanında ✓ (Gri), ✓✓ (Gri) veya ✓✓ (Mavi)
-                    val tickTxt = TextView(this).apply {
-                        text = if (msg.status == STATUS_SENT) "  ✓" else "  ✓✓"
-                        textSize = 11.5f
-                        setTypeface(null, Typeface.BOLD)
-                        setTextColor(
-                            Color.parseColor(
-                                when (msg.status) {
-                                    STATUS_READ -> "#53BDEB" // Parlak WhatsApp Mavi Tik Rengi
-                                    else -> "#9EA2A8"        // Gri Tik Rengi
-                                }
-                            )
-                        )
-                    }
-                    metaRow.addView(tickTxt)
-                }
-            }
-
-            row.addView(bubbleBox)
-            row.addView(metaRow)
-            messagesContainer?.addView(row)
-        }
-
-        messagesScroll?.post { messagesScroll?.fullScroll(View.FOCUS_DOWN) }
-    }
-
-    private fun sendMessageNow() {
-        val text = replyEdit?.text?.toString()?.trim() ?: return
-        if (text.isEmpty()) return
-
-        val active = activeSessions[activeChatKey] ?: return
-        val action = active.replyAction
-
-        recentSentTexts[text] = System.currentTimeMillis()
-        extraToolPanel?.visibility = View.GONE
-
-        if (action == null) {
-            // Test balonunda: Önce Tek Tik (✓), 1 sn sonra Çift Gri Tik (✓✓), 2.2 sn sonra Mavi Tik (✓✓) simülasyonu
-            val newMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
-            active.messages.add(newMsg)
-            saveMessagesToDisk(active.key, active.messages)
-            replyEdit?.setText("")
-            refreshExpandedUI()
-
-            mainHandler.postDelayed({
-                newMsg.status = STATUS_DELIVERED
-                refreshExpandedUI()
-            }, 900)
-
-            mainHandler.postDelayed({
-                newMsg.status = STATUS_READ
-                refreshExpandedUI()
-            }, 2000)
-            return
-        }
-
-        try {
-            val intent = Intent()
-            val bundle = Bundle()
-            for (remoteInput in action.remoteInputs) {
-                bundle.putCharSequence(remoteInput.resultKey, text)
-            }
-            RemoteInput.addResultsToIntent(action.remoteInputs, intent, bundle)
-
-            val optionsBundle = if (Build.VERSION.SDK_INT >= 34) {
-                ActivityOptions.makeBasic()
-                    .setPendingIntentBackgroundActivityStartMode(
-                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
-                    )
-                    .toBundle()
-            } else null
-
-            action.actionIntent.send(this, 0, intent, null, null, null, optionsBundle)
-
-            // İlk gönderildiği salise Tek Tik (✓) olarak ekle
-            val sentMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
-            active.messages.add(sentMsg)
-            saveMessagesToDisk(active.key, active.messages)
-            replyEdit?.setText("")
-            refreshExpandedUI()
-
-            // 1.1 saniye sonra iletildi (✓✓) olarak güncelle
-            mainHandler.postDelayed({
-                if (sentMsg.status < STATUS_DELIVERED) {
-                    sentMsg.status = STATUS_DELIVERED
-                    saveMessagesToDisk(active.key, active.messages)
-                    if (isExpanded && activeChatKey == active.key) {
-                        refreshExpandedUI()
-                    }
-                }
-            }, 1100)
-
-            scheduleCancelNotification(active.sbnKey, 450)
-        } catch (_: PendingIntent.CanceledException) {
-            Toast.makeText(
-                this,
-                "Bildirim süresi dolmuş, sağ üstten '↗' tuşuna basabilirsin kanka.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    private fun collapseChat() {
-        if (!isExpanded) return
-        isExpanded = false
-        stopAudio()
-
-        try {
-            val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.hideSoftInputFromWindow(replyEdit?.windowToken, 0)
-        } catch (_: Exception) {}
-
-        expandedOverlayView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        expandedOverlayView = null
-        fullScreenImageOverlay = null
-        extraToolPanel = null
-
-        bubbleView?.visibility = View.VISIBLE
-        activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
-    }
-
-    private fun destroyAllOverlays() {
-        isExpanded = false
-        stopAudio()
-        expandedOverlayView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        expandedOverlayView = null
-        fullScreenImageOverlay = null
-        extraToolPanel = null
-
-        bubbleView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        bubbleView = null
-
-        dismissBarView?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        dismissBarView = null
-        activeChatKey = null
-    }
-
-    private fun dpToPx(dp: Int): Int {
-        return TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP,
-            dp.toFloat(),
-            resources.displayMetrics
-        ).toInt()
-    }
-}
-
-// ==================== UYGULAMA İÇİ SOHBET, MAVİ TİK, GÖRÜLDÜ VE INSTAGRAM ARAMA SERVİSİ ====================
-class ChatSyncService : AccessibilityService() {
-
-    private var lastSyncTime = 0L
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        event ?: return
-        val pkg = event.packageName?.toString() ?: return
-        if (!BubbleService.TARGET_PACKAGES.contains(pkg)) return
-
-        val root = rootInActiveWindow ?: return
-
-        // 1. Eğer kullanıcı Instagram balonunda Sesli veya Görüntülü Arama tuşuna bastıysa (7 sn içinde)
-        // Instagram DM ekranı açılır açılmaz sağ üstteki Sesli/Görüntülü arama ikonuna otomatik tıkla!
-        if (pkg.contains("instagram") && BubbleService.pendingInstaCallVideo != null) {
-            val elapsed = System.currentTimeMillis() - BubbleService.pendingInstaCallTimestamp
-            if (elapsed < 7500) {
-                val wantVideo = BubbleService.pendingInstaCallVideo == true
-                if (tryClickInstagramCallButton(root, wantVideo)) {
-                    BubbleService.pendingInstaCallVideo = null
-                    return
-                }
-            } else {
-                BubbleService.pendingInstaCallVideo = null
-            }
-        }
-
-        val now = System.currentTimeMillis()
-        if (now - lastSyncTime < 850) return
-        lastSyncTime = now
-
-        try {
-            val screenWidth = resources.displayMetrics.widthPixels
-            val titleNode = findHeaderTitle(root, pkg) ?: return
-            val chatTitle = titleNode.trim()
-            if (chatTitle.isEmpty()) return
-
-            val messages = mutableListOf<Triple<String, Boolean, Int>>()
-            collectMessagesAndStatus(root, pkg, screenWidth, messages)
-
-            if (messages.isNotEmpty()) {
-                BubbleService.instance?.syncFromAppScreen(pkg, chatTitle, messages)
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun tryClickInstagramCallButton(root: AccessibilityNodeInfo, isVideo: Boolean): Boolean {
-        val keywords = if (isVideo) {
-            listOf("görüntülü arama", "görüntülü", "video call", "video")
-        } else {
-            listOf("sesli arama", "sesli", "audio call", "voice call", "ara")
-        }
-
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            val desc = node.contentDescription?.toString()?.lowercase(Locale.getDefault()) ?: ""
-            if (desc.isNotEmpty() && keywords.any { desc.contains(it) }) {
-                if (node.isClickable) {
-                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    return true
-                } else if (node.parent?.isClickable == true) {
-                    node.parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    return true
-                }
-            }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
-        }
-        return false
-    }
-
-    private fun findHeaderTitle(root: AccessibilityNodeInfo, pkg: String): String? {
-        val idCandidates = if (pkg.contains("whatsapp")) {
-            listOf("com.whatsapp:id/conversation_contact_name", "com.whatsapp.w4b:id/conversation_contact_name")
-        } else {
-            listOf(
-                "com.instagram.android:id/thread_title",
-                "com.instagram.android:id/action_bar_title",
-                "com.instagram.android:id/header_title"
-            )
-        }
-
-        for (id in idCandidates) {
-            val list = root.findAccessibilityNodeInfosByViewId(id)
-            if (!list.isNullOrEmpty()) {
-                val txt = list[0].text?.toString()?.trim()
-                if (!txt.isNullOrEmpty()) return txt
-            }
-        }
-        return null
-    }
-
-    private fun collectMessagesAndStatus(
-        root: AccessibilityNodeInfo,
-        pkg: String,
-        screenWidth: Int,
-        outList: MutableList<Triple<String, Boolean, Int>>
-    ) {
-        if (pkg.contains("whatsapp")) {
-            // WhatsApp'taki son tik durumunu kontrol et (Okundu / İletildi / Gönderildi)
-            val overallTickStatus = detectWhatsAppTickStatus(root)
-            val idList = listOf("com.whatsapp:id/message_text", "com.whatsapp.w4b:id/message_text")
-            for (id in idList) {
-                val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
-                for (node in nodes) {
-                    val txt = node.text?.toString()?.trim() ?: continue
-                    if (txt.isEmpty()) continue
-                    val rect = Rect()
-                    node.getBoundsInScreen(rect)
-                    val isMe = rect.centerX() > (screenWidth * 0.50f) || rect.left > (screenWidth * 0.22f)
-                    val st = if (isMe) overallTickStatus else BubbleService.STATUS_READ
-                    outList.add(Triple(txt, isMe, st))
-                }
-            }
-        } else if (pkg.contains("instagram")) {
-            // Instagram'da ekranda "Görüldü" veya "Seen" yazısı var mı kontrol et
-            val isSeen = checkInstagramSeenText(root)
-            if (isSeen) {
-                val title = findHeaderTitle(root, pkg) ?: return
-                val key = "${pkg}_${title.trim().lowercase(Locale.getDefault())}"
-                BubbleService.instance?.markSessionMessagesStatus(key, BubbleService.STATUS_READ)
-            }
-        }
-    }
-
-    private fun detectWhatsAppTickStatus(root: AccessibilityNodeInfo): Int {
-        val statusIds = listOf("com.whatsapp:id/status", "com.whatsapp.w4b:id/status")
-        var latestStatus = BubbleService.STATUS_DELIVERED
-        for (id in statusIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
-            for (node in nodes) {
-                val desc = node.contentDescription?.toString()?.lowercase(Locale.getDefault()) ?: ""
-                if (desc.contains("okundu") || desc.contains("read") || desc.contains("görüldü")) {
-                    latestStatus = BubbleService.STATUS_READ
-                } else if (desc.contains("iletildi") || desc.contains("delivered")) {
-                    if (latestStatus < BubbleService.STATUS_DELIVERED) latestStatus = BubbleService.STATUS_DELIVERED
-                }
-            }
-        }
-        return latestStatus
-    }
-
-    private fun checkInstagramSeenText(root: AccessibilityNodeInfo): Boolean {
-        val seenNodes = root.findAccessibilityNodeInfosByText("Görüldü")
-        if (!seenNodes.isNullOrEmpty()) return true
-        val seenEnNodes = root.findAccessibilityNodeInfosByText("Seen")
-        return !seenEnNodes.isNullOrEmpty()
-    }
-
-    override fun onInterrupt() {}
-}
