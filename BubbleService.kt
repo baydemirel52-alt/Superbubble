@@ -54,20 +54,11 @@ class BubbleService : NotificationListenerService() {
             "com.instagram.android"
         )
 
-        // Gerçek Mesaj Durum Kodları
-        const val STATUS_SENDING = 0   // 🕒 (Gönderiliyor)
-        const val STATUS_SENT = 1      // ✓ Tek Gri Tik (Sunucuya Gönderildi - Karşı tarafın interneti kapalı olabilir)
-        const val STATUS_DELIVERED = 2 // ✓✓ Çift Gri Tik (Karşı cihaza İletildi)
-        const val STATUS_READ = 3      // ✓✓ Çift Mavi Tik / Görüldü (Karşı taraf okudu)
-
         var instance: BubbleService? = null
 
+        // Instagram'da sohbet açılınca otomatik arama tuşuna basmak için geçici emir
         var pendingInstaCallVideo: Boolean? = null
         var pendingInstaCallTimestamp: Long = 0L
-
-        // Canlı Tik ve Çevrimiçi/Son Görülme Yoklaması
-        var pendingQuickSync: Boolean = false
-        var pendingQuickSyncTimestamp: Long = 0L
 
         fun spawnTestBubble(context: Context) {
             val srv = instance
@@ -87,10 +78,9 @@ class BubbleService : NotificationListenerService() {
                     sender = "Test Sohbeti",
                     messagesBatch = listOf(
                         ChatMessage(
-                            text = "Kanka sahte çift tik kaldırıldı! Üstteki 🔄 tuşuyla gerçek tik ve son görülme yoklaması yapabilirsin.",
+                            text = "Kanka tikler ve son görülme kaldırıldı. Her şey sade, net ve tam istediğin gibi!",
                             isMe = false,
-                            time = srv.nowTime(),
-                            status = STATUS_READ
+                            time = srv.nowTime()
                         )
                     ),
                     appName = "WhatsApp",
@@ -110,8 +100,7 @@ class BubbleService : NotificationListenerService() {
         val isMe: Boolean,
         val time: String,
         var imageBase64: String? = null,
-        val audioUri: String? = null,
-        var status: Int = STATUS_SENT
+        val audioUri: String? = null
     )
 
     data class ChatSession(
@@ -126,7 +115,6 @@ class BubbleService : NotificationListenerService() {
         var contentIntent: PendingIntent? = null,
         var callIntent: PendingIntent? = null,
         var isIncomingCall: Boolean = false,
-        var presenceStatus: String? = null, // "çevrimiçi", "son görülme...", "yazıyor...", "Şu anda aktif"
         var unreadCount: Int = 0
     )
 
@@ -271,11 +259,9 @@ class BubbleService : NotificationListenerService() {
             return
         }
 
-        // ==================== 2. GÖNDERİLEN MESAJ YANSIMASI (SAHTE ÇİFT TİK YAPMAZ!) ====================
+        // ==================== 2. NORMAL MESAJ & YANSIMA FİLTRESİ ====================
         val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
         if (!remoteHistory.isNullOrEmpty()) {
-            // Bu sadece bizim yazdığımız cevabın bildirim yansımasıdır; karşı tarafa iletildiği anlamına GELMEZ!
-            // O yüzden STATUS_DELIVERED yapmıyoruz, sadece üstteki yansıma bildirimini temizliyoruz.
             scheduleCancelNotification(sbn.key, 350)
             return
         }
@@ -349,8 +335,7 @@ class BubbleService : NotificationListenerService() {
                         isMe = isFromMe,
                         time = nowTime(),
                         imageBase64 = bitmapToBase64(itemBmp),
-                        audioUri = itemAudio,
-                        status = if (isFromMe) STATUS_SENT else STATUS_READ
+                        audioUri = itemAudio
                     )
                 )
             }
@@ -384,8 +369,7 @@ class BubbleService : NotificationListenerService() {
                     isMe = false,
                     time = nowTime(),
                     imageBase64 = bitmapToBase64(photoBitmap),
-                    audioUri = audioUriStr,
-                    status = STATUS_READ
+                    audioUri = audioUriStr
                 )
             )
         } else if (photoBitmap != null && extractedBatch.last().imageBase64 == null) {
@@ -426,12 +410,11 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== GERÇEK TİK VE ÇEVRİMİÇİ / SON GÖRÜLME EŞİTLEME ====================
+    // Uygulama içi ekrandan (ChatSyncService) okunan mesajları balon geçmişine ekler
     fun syncFromAppScreen(
         pkgName: String,
         title: String,
-        presenceText: String?,
-        screenMessages: List<Triple<String, Boolean, Int>>
+        screenMessages: List<Pair<String, Boolean>>
     ) {
         val cleanTitle = title.trim()
         if (cleanTitle.isEmpty() || cleanTitle.equals("WhatsApp", true) || cleanTitle.equals("Instagram", true)) return
@@ -439,7 +422,6 @@ class BubbleService : NotificationListenerService() {
         val chatKey = "${pkgName}_${cleanTitle.lowercase(Locale.getDefault())}"
 
         mainHandler.post {
-            // Eğer başka bir ön-isimle ("test_messenger" dışındaki boş kafa) açılmışsa birleştir
             val session = activeSessions.getOrPut(chatKey) {
                 ChatSession(
                     key = chatKey,
@@ -451,25 +433,14 @@ class BubbleService : NotificationListenerService() {
             }
 
             var changed = false
-            if (!presenceText.isNullOrBlank() && session.presenceStatus != presenceText) {
-                session.presenceStatus = presenceText
-                changed = true
-            }
-
-            for ((msgText, isMe, realTickStatus) in screenMessages) {
-                val existing = session.messages.findLast { it.text == msgText && it.isMe == isMe }
-                if (existing != null) {
-                    if (isMe && existing.status != realTickStatus) {
-                        existing.status = realTickStatus
-                        changed = true
-                    }
-                } else {
+            for ((msgText, isMe) in screenMessages) {
+                val exists = session.messages.any { it.text == msgText && it.isMe == isMe }
+                if (!exists) {
                     session.messages.add(
                         ChatMessage(
                             text = msgText,
                             isMe = isMe,
-                            time = nowTime(),
-                            status = realTickStatus
+                            time = nowTime()
                         )
                     )
                     changed = true
@@ -483,31 +454,6 @@ class BubbleService : NotificationListenerService() {
                 }
             }
         }
-    }
-
-    fun reopenAfterQuickSync() {
-        mainHandler.postDelayed({
-            if (!isExpanded && activeSessions.isNotEmpty()) {
-                openExpandedChat()
-                Toast.makeText(this, "✅ Tikler ve Son Görülme güncellendi!", Toast.LENGTH_SHORT).show()
-            }
-        }, 350)
-    }
-
-    private fun triggerQuickLiveSync() {
-        if (activeChatKey == "test_messenger") {
-            val active = activeSessions[activeChatKey] ?: return
-            active.presenceStatus = "çevrimiçi"
-            active.messages.forEach { if (it.isMe) it.status = STATUS_READ }
-            refreshExpandedUI()
-            Toast.makeText(this, "Test: Durum 'çevrimiçi' ve Mavi Tik yapıldı!", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        pendingQuickSync = true
-        pendingQuickSyncTimestamp = System.currentTimeMillis()
-        Toast.makeText(this, "🔄 Gerçek tik ve son görülme yoklanıyor...", Toast.LENGTH_SHORT).show()
-        openOriginalApp()
     }
 
     private fun isIncomingCallText(txt: String): Boolean {
@@ -667,7 +613,7 @@ class BubbleService : NotificationListenerService() {
 
         return ImageView(this).apply {
             layoutParams = LinearLayout.LayoutParams(sizePx, sizePx).apply {
-                rightMargin = dpToPx(5)
+                rightMargin = dpToPx(6)
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -845,8 +791,7 @@ class BubbleService : NotificationListenerService() {
                         isMe = obj.optBoolean("isMe", false),
                         time = obj.optString("time", ""),
                         imageBase64 = obj.optString("img", "").ifEmpty { null },
-                        audioUri = obj.optString("aud", "").ifEmpty { null },
-                        status = obj.optInt("st", STATUS_SENT)
+                        audioUri = obj.optString("aud", "").ifEmpty { null }
                     )
                 )
             }
@@ -864,7 +809,6 @@ class BubbleService : NotificationListenerService() {
                 obj.put("text", m.text)
                 obj.put("isMe", m.isMe)
                 obj.put("time", m.time)
-                obj.put("st", m.status)
                 if (m.imageBase64 != null) obj.put("img", m.imageBase64)
                 if (m.audioUri != null) obj.put("aud", m.audioUri)
                 arr.put(obj)
@@ -943,10 +887,7 @@ class BubbleService : NotificationListenerService() {
         session.isIncomingCall = isIncomingCall
 
         var addedNew = false
-        var hasIncomingFromOther = false
-
         for (incoming in messagesBatch) {
-            if (!incoming.isMe) hasIncomingFromOther = true
             val existing = session.messages.lastOrNull { it.text == incoming.text && it.isMe == incoming.isMe }
             if (existing != null) {
                 if (incoming.imageBase64 != null && existing.imageBase64 == null) {
@@ -957,11 +898,6 @@ class BubbleService : NotificationListenerService() {
                 session.messages.add(incoming)
                 addedNew = true
             }
-        }
-
-        // Karşı taraf o an yeni bir mesaj gönderdiyse o an çevrimiçidir
-        if (hasIncomingFromOther) {
-            session.presenceStatus = if (appName == "Instagram") "Şu anda aktif" else "çevrimiçi"
         }
 
         if (addedNew) {
@@ -1223,7 +1159,7 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ (KLAVYE TAŞMASI DÜZELTİLDİ) ====================
+    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ ====================
     private fun openExpandedChat() {
         if (isExpanded || activeSessions.isEmpty()) return
         isExpanded = true
@@ -1271,7 +1207,6 @@ class BubbleService : NotificationListenerService() {
             WindowManager.LayoutParams.MATCH_PARENT
         }
 
-        // S22 Ultra'da klavye açıldığında alt barın klavye altında kalmaması için 0.42f yüksekliğe ayarlandı
         val cardHeight = if (isLandscape) {
             (metrics.heightPixels * 0.72f).toInt()
         } else {
@@ -1430,21 +1365,6 @@ class BubbleService : NotificationListenerService() {
         titleCol.addView(headerNameTxt)
         titleCol.addView(headerSubTxt)
 
-        // 🔄 Canlı Tik & Son Görülme Yoklama Butonu
-        val syncNowBtn = TextView(this).apply {
-            text = "🔄"
-            textSize = 14f
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(34), dpToPx(34)).apply {
-                rightMargin = dpToPx(5)
-            }
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#263951"))
-            }
-            setOnClickListener { triggerQuickLiveSync() }
-        }
-
         val voiceCallIcon = createMessengerVectorIcon(isVideo = false) {
             initiateCall(isVideo = false)
         }
@@ -1469,7 +1389,6 @@ class BubbleService : NotificationListenerService() {
 
         cardHeader.addView(headerAvatarBox)
         cardHeader.addView(titleCol)
-        cardHeader.addView(syncNowBtn)
         cardHeader.addView(voiceCallIcon)
         cardHeader.addView(videoCallIcon)
         cardHeader.addView(openAppBtn)
@@ -1986,14 +1905,7 @@ class BubbleService : NotificationListenerService() {
 
         val isInsta = active.appName == "Instagram"
         headerNameTxt?.text = active.sender
-
-        // Çevrimiçi / Son Görülme bilgisi varsa başlık altında canlı göster!
-        val subLine = when {
-            active.isIncomingCall -> "📞 Gelen Arama..."
-            !active.presenceStatus.isNullOrBlank() -> "${active.appName} • ${active.presenceStatus}"
-            else -> active.appName
-        }
-        headerSubTxt?.text = subLine
+        headerSubTxt?.text = if (active.isIncomingCall) "📞 Gelen Arama..." else active.appName
         headerSubTxt?.setTextColor(
             Color.parseColor(if (isInsta) "#E1306C" else "#25D366")
         )
@@ -2001,9 +1913,7 @@ class BubbleService : NotificationListenerService() {
         incomingCallBanner?.visibility = if (active.isIncomingCall) View.VISIBLE else View.GONE
 
         messagesContainer?.removeAllViews()
-        val lastMyMsgIndex = active.messages.indexOfLast { it.isMe }
-
-        active.messages.forEachIndexed { index, msg ->
+        active.messages.forEach { msg ->
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(
@@ -2101,65 +2011,16 @@ class BubbleService : NotificationListenerService() {
                 bubbleBox.addView(reelBtn)
             }
 
-            val metaRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-                setPadding(dpToPx(6), dpToPx(2), dpToPx(6), 0)
-            }
-
+            // Sadece sade saat gösterimi (Tik ve Görüldü kalabalığı kaldırıldı)
             val timeTxt = TextView(this).apply {
                 text = msg.time
                 textSize = 10f
                 setTextColor(Color.parseColor("#8A8D91"))
-            }
-            metaRow.addView(timeTxt)
-
-            if (msg.isMe) {
-                if (isInsta) {
-                    if (index == lastMyMsgIndex) {
-                        val igStatusTxt = TextView(this).apply {
-                            text = when (msg.status) {
-                                STATUS_SENDING -> "  • Gönderiliyor..."
-                                STATUS_SENT -> "  • Gönderildi"
-                                STATUS_DELIVERED -> "  • İletildi"
-                                else -> "  • Görüldü 👀"
-                            }
-                            textSize = 10.5f
-                            setTypeface(null, if (msg.status == STATUS_READ) Typeface.BOLD else Typeface.NORMAL)
-                            setTextColor(
-                                Color.parseColor(if (msg.status == STATUS_READ) "#53BDEB" else "#9EA2A8")
-                            )
-                        }
-                        metaRow.addView(igStatusTxt)
-                    }
-                } else {
-                    val tickTxt = TextView(this).apply {
-                        text = when (msg.status) {
-                            STATUS_SENDING -> "  🕒"
-                            STATUS_SENT -> "  ✓"
-                            else -> "  ✓✓"
-                        }
-                        textSize = 11.5f
-                        setTypeface(null, Typeface.BOLD)
-                        setTextColor(
-                            Color.parseColor(
-                                when (msg.status) {
-                                    STATUS_READ -> "#53BDEB" // Gerçek Mavi Tik
-                                    else -> "#9EA2A8"        // Gerçek Gri Tik (✓ veya ✓✓)
-                                }
-                            )
-                        )
-                    }
-                    metaRow.addView(tickTxt)
-                }
+                setPadding(dpToPx(6), dpToPx(2), dpToPx(6), 0)
             }
 
             row.addView(bubbleBox)
-            row.addView(metaRow)
+            row.addView(timeTxt)
             messagesContainer?.addView(row)
         }
 
@@ -2177,8 +2038,7 @@ class BubbleService : NotificationListenerService() {
         extraToolPanel?.visibility = View.GONE
 
         if (action == null) {
-            val newMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
-            active.messages.add(newMsg)
+            active.messages.add(ChatMessage(text = text, isMe = true, time = nowTime()))
             saveMessagesToDisk(active.key, active.messages)
             replyEdit?.setText("")
             refreshExpandedUI()
@@ -2203,10 +2063,7 @@ class BubbleService : NotificationListenerService() {
 
             action.actionIntent.send(this, 0, intent, null, null, null, optionsBundle)
 
-            // Gerçek Durum: Mesaj sunucuya gönderildi -> Tek Gri Tik (✓) olarak kalır!
-            // Karşı tarafın interneti kapalıysa asla sahte çift tike (✓✓) geçmez.
-            val sentMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
-            active.messages.add(sentMsg)
+            active.messages.add(ChatMessage(text = text, isMe = true, time = nowTime()))
             saveMessagesToDisk(active.key, active.messages)
             replyEdit?.setText("")
             refreshExpandedUI()
@@ -2273,7 +2130,7 @@ class BubbleService : NotificationListenerService() {
     }
 }
 
-// ==================== GERÇEK TİK (✓, ✓✓, MAVİ ✓✓), INSTAGRAM GÖRÜLDÜ VE ÇEVRİMİÇİ / SON GÖRÜLME OKUYUCU ====================
+// ==================== SADECE SOHBET GEÇMİŞİ EŞİTLEME VE INSTAGRAM ARAMA SERVİSİ ====================
 class ChatSyncService : AccessibilityService() {
 
     private var lastSyncTime = 0L
@@ -2285,7 +2142,7 @@ class ChatSyncService : AccessibilityService() {
 
         val root = rootInActiveWindow ?: return
 
-        // 1. Instagram Otomatik Sesli / Görüntülü Arama Tıklayıcı
+        // Instagram Otomatik Sesli / Görüntülü Arama Tıklayıcı
         if (pkg.contains("instagram") && BubbleService.pendingInstaCallVideo != null) {
             val elapsed = System.currentTimeMillis() - BubbleService.pendingInstaCallTimestamp
             if (elapsed < 7500) {
@@ -2300,7 +2157,7 @@ class ChatSyncService : AccessibilityService() {
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastSyncTime < 450) return
+        if (now - lastSyncTime < 800) return
         lastSyncTime = now
 
         try {
@@ -2309,151 +2166,38 @@ class ChatSyncService : AccessibilityService() {
             val chatTitle = titleNode.trim()
             if (chatTitle.isEmpty()) return
 
-            // Kişinin Çevrimiçi / Son Görülme / Yazıyor... bilgisini çek
-            val presence = extractPresenceStatus(root, pkg)
+            val messages = mutableListOf<Pair<String, Boolean>>()
+            collectMessagesFromNode(root, pkg, screenWidth, messages)
 
-            // Her mesajın kendi tik durumunu (Tek Tik ✓, Çift Tik ✓✓, Mavi Tik ✓✓ veya Görüldü) oku
-            val messages = mutableListOf<Triple<String, Boolean, Int>>()
-            collectExactMessagesAndTicks(root, pkg, screenWidth, messages)
-
-            BubbleService.instance?.syncFromAppScreen(pkg, chatTitle, presence, messages)
-
-            // Eğer kullanıcı balonun üstündeki 🔄 (Canlı Yokla) tuşuna bastıysa:
-            // Verileri okuduktan hemen sonra otomatik Geri (Back) tuşuna basıp balonu tekrar aç!
-            if (BubbleService.pendingQuickSync) {
-                val elapsed = System.currentTimeMillis() - BubbleService.pendingQuickSyncTimestamp
-                if (elapsed in 250..6000 && (messages.isNotEmpty() || presence != null)) {
-                    BubbleService.pendingQuickSync = false
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    BubbleService.instance?.reopenAfterQuickSync()
-                }
+            if (messages.isNotEmpty()) {
+                BubbleService.instance?.syncFromAppScreen(pkg, chatTitle, messages)
             }
         } catch (_: Exception) {}
     }
 
-    private fun extractPresenceStatus(root: AccessibilityNodeInfo, pkg: String): String? {
-        if (pkg.contains("whatsapp")) {
-            val statusIds = listOf(
-                "com.whatsapp:id/conversation_contact_status",
-                "com.whatsapp.w4b:id/conversation_contact_status"
-            )
-            for (id in statusIds) {
-                val nodes = root.findAccessibilityNodeInfosByViewId(id)
-                if (!nodes.isNullOrEmpty()) {
-                    val txt = nodes[0].text?.toString()?.trim()
-                    if (!txt.isNullOrEmpty()) return txt
-                }
-            }
-        } else if (pkg.contains("instagram")) {
-            val igStatusIds = listOf(
-                "com.instagram.android:id/thread_presence_digest",
-                "com.instagram.android:id/action_bar_subtitle",
-                "com.instagram.android:id/header_subtitle"
-            )
-            for (id in igStatusIds) {
-                val nodes = root.findAccessibilityNodeInfosByViewId(id)
-                if (!nodes.isNullOrEmpty()) {
-                    val txt = nodes[0].text?.toString()?.trim()
-                    if (!txt.isNullOrEmpty()) return txt
-                }
-            }
-        }
-        return null
-    }
-
-    private fun collectExactMessagesAndTicks(
+    private fun collectMessagesFromNode(
         root: AccessibilityNodeInfo,
         pkg: String,
         screenWidth: Int,
-        outList: MutableList<Triple<String, Boolean, Int>>
+        outList: MutableList<Pair<String, Boolean>>
     ) {
-        if (pkg.contains("whatsapp")) {
-            val idList = listOf("com.whatsapp:id/message_text", "com.whatsapp.w4b:id/message_text")
-            for (id in idList) {
-                val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
-                for (node in nodes) {
-                    val txt = node.text?.toString()?.trim() ?: continue
-                    if (txt.isEmpty()) continue
-                    val rect = Rect()
-                    node.getBoundsInScreen(rect)
-                    val isMe = rect.centerX() > (screenWidth * 0.50f) || rect.left > (screenWidth * 0.22f)
+        val idList = if (pkg.contains("whatsapp")) {
+            listOf("com.whatsapp:id/message_text", "com.whatsapp.w4b:id/message_text")
+        } else {
+            listOf("com.instagram.android:id/direct_text_message_text_view", "com.instagram.android:id/message_text")
+        }
 
-                    // Eğer mesaj bizimse, o mesaj kutusunun içindeki gerçek tik ikonunu (✓, ✓✓ veya Mavi ✓✓) bul!
-                    val exactStatus = if (isMe) {
-                        findTickStatusInRow(node)
-                    } else {
-                        BubbleService.STATUS_READ
-                    }
-                    outList.add(Triple(txt, isMe, exactStatus))
-                }
-            }
-        } else if (pkg.contains("instagram")) {
-            val isSeen = checkInstagramSeenText(root)
-            val msgIds = listOf(
-                "com.instagram.android:id/direct_text_message_text_view",
-                "com.instagram.android:id/message_text"
-            )
-            for (id in msgIds) {
-                val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
-                for (node in nodes) {
-                    val txt = node.text?.toString()?.trim() ?: continue
-                    if (txt.isEmpty()) continue
-                    val rect = Rect()
-                    node.getBoundsInScreen(rect)
-                    val isMe = rect.centerX() > (screenWidth * 0.50f)
-                    val st = if (isMe) {
-                        if (isSeen) BubbleService.STATUS_READ else BubbleService.STATUS_DELIVERED
-                    } else {
-                        BubbleService.STATUS_READ
-                    }
-                    outList.add(Triple(txt, isMe, st))
-                }
+        for (id in idList) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
+            for (node in nodes) {
+                val txt = node.text?.toString()?.trim() ?: continue
+                if (txt.isEmpty()) continue
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                val isMe = rect.centerX() > (screenWidth * 0.50f) || rect.left > (screenWidth * 0.22f)
+                outList.add(Pair(txt, isMe))
             }
         }
-    }
-
-    // Mesaj balonunun kendi satırındaki (ViewGroup) tik ikonunun açıklamasını okur
-    private fun findTickStatusInRow(msgNode: AccessibilityNodeInfo): Int {
-        var currentParent: AccessibilityNodeInfo? = msgNode.parent
-        for (depth in 0..2) {
-            if (currentParent == null) break
-            val found = searchTickDescriptionInSubtree(currentParent)
-            if (found != null) return found
-            currentParent = currentParent.parent
-        }
-        return BubbleService.STATUS_SENT
-    }
-
-    private fun searchTickDescriptionInSubtree(node: AccessibilityNodeInfo): Int? {
-        val viewId = node.viewIdResourceName ?: ""
-        val desc = node.contentDescription?.toString()?.lowercase(Locale.getDefault()) ?: ""
-
-        if (viewId.endsWith(":id/status") || desc.isNotEmpty()) {
-            when {
-                desc.contains("okundu") || desc.contains("read") || desc.contains("görüldü") || desc.contains("oynatıldı") ->
-                    return BubbleService.STATUS_READ
-                desc.contains("iletildi") || desc.contains("delivered") ->
-                    return BubbleService.STATUS_DELIVERED
-                desc.contains("gönderildi") || desc.contains("sent") ->
-                    return BubbleService.STATUS_SENT
-                desc.contains("bekliyor") || desc.contains("gönderiliyor") || desc.contains("sending") || desc.contains("unsent") ->
-                    return BubbleService.STATUS_SENDING
-            }
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            val res = searchTickDescriptionInSubtree(child)
-            if (res != null) return res
-        }
-        return null
-    }
-
-    private fun checkInstagramSeenText(root: AccessibilityNodeInfo): Boolean {
-        val seenNodes = root.findAccessibilityNodeInfosByText("Görüldü")
-        if (!seenNodes.isNullOrEmpty()) return true
-        val seenEnNodes = root.findAccessibilityNodeInfosByText("Seen")
-        return !seenEnNodes.isNullOrEmpty()
     }
 
     private fun tryClickInstagramCallButton(root: AccessibilityNodeInfo, isVideo: Boolean): Boolean {
