@@ -24,13 +24,86 @@ jobs:
         with:
           gradle-version: '8.4'
 
-      - name: Proje Klasorlerini Otomatik Hazirla
+      - name: Proje Klasorlerini ve Logoyu Otomatik Hazirla
         run: |
           mkdir -p app/src/main/java/com/selim/superbubble
-          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
-          sed -i 's/package="com.selim.superbubble"//g' app/src/main/AndroidManifest.xml
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+
           cp MainActivity.kt app/src/main/java/com/selim/superbubble/MainActivity.kt
           cp BubbleService.kt app/src/main/java/com/selim/superbubble/BubbleService.kt
+
+          python3 -c '
+          manifest = """<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="SuperBubble"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BubbleService"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:foregroundServiceType="specialUse"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="chat_bubble_overlay" />
+                  </service>
+              </application>
+          </manifest>"""
+          open("app/src/main/AndroidManifest.xml", "w").write(manifest.strip())
+
+          bg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#0F172A" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#1E293B" android:pathData="M0,0L108,108L0,108z"/>
+          </vector>"""
+          open("app/src/main/res/drawable/ic_launcher_bg.xml", "w").write(bg.strip())
+
+          fg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#25D366" android:pathData="M42,30 C28,30 18,39 18,51 C18,57 21,62 26,66 L23,76 L34,71 C37,72 39,72 42,72 C56,72 66,63 66,51 C66,39 56,30 42,30 Z"/>
+              <path android:fillColor="#0084FF" android:pathData="M64,40 C50,40 40,49 40,61 C40,73 50,82 64,82 C67,82 70,81 73,80 L84,85 L81,75 C86,71 88,66 88,61 C88,49 78,40 64,40 Z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M52,56h24v4h-24zM52,64h16v4h-16z"/>
+          </vector>"""
+          open("app/src/main/res/drawable/ic_launcher_fg.xml", "w").write(fg.strip())
+
+          adaptive = """<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_bg"/>
+              <foreground android:drawable="@drawable/ic_launcher_fg"/>
+          </adaptive-icon>"""
+          open("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w").write(adaptive.strip())
+          '
 
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
@@ -77,8 +150,8 @@ jobs:
                   applicationId "com.selim.superbubble"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 3
+                  versionName "3.0"
               }
 
               compileOptions {
