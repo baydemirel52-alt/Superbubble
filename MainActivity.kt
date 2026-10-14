@@ -29,24 +29,24 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(60, 60, 60, 60)
+            setPadding(55, 55, 55, 55)
         }
 
         val title = TextView(this).apply {
-            text = "SuperBubble Pro Kontrol Paneli"
+            text = "SuperBubble Messenger Pro"
             textSize = 21f
             setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 30)
+            setPadding(0, 0, 0, 25)
         }
 
         statusText = TextView(this).apply {
-            textSize = 14.5f
+            textSize = 14f
             setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, 40)
+            setPadding(0, 0, 0, 35)
         }
 
         val btnOverlay = Button(this).apply {
-            text = "1. Ekran Üstü Balon İznini Ver"
+            text = "1. Ekran Üstü Balon İzni"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     startActivity(
@@ -56,22 +56,34 @@ class MainActivity : AppCompatActivity() {
                         )
                     )
                 } else {
-                    Toast.makeText(this@MainActivity, "Ekran üstü izni zaten aktif kanka!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Bu izin zaten aktif kanka!", Toast.LENGTH_SHORT).show()
                 }
             }
         }
 
         val btnNotification = Button(this).apply {
-            text = "2. Bildirim Yakalama İznini Ver"
+            text = "2. Bildirim & Arama Yakalama İzni"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
             }
         }
 
-        val btnMedia = Button(this).apply {
-            text = "3. Fotoğraf Görme ve Gönderme İzni"
+        val btnMediaAndContacts = Button(this).apply {
+            text = "3. Fotoğraf & Sesli/Görüntülü Arama İzni"
             setOnClickListener {
-                requestPhotoPermission()
+                requestRuntimePermissions()
+            }
+        }
+
+        val btnAccessibility = Button(this).apply {
+            text = "4. WhatsApp İçi Geçmiş Eşitleme İzni"
+            setOnClickListener {
+                Toast.makeText(
+                    this@MainActivity,
+                    "İndirilen Uygulamalar > SuperBubble'ı açıp aktif et kanka",
+                    Toast.LENGTH_LONG
+                ).show()
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             }
         }
 
@@ -90,48 +102,61 @@ class MainActivity : AppCompatActivity() {
         layout.addView(statusText)
         layout.addView(btnOverlay)
         layout.addView(btnNotification)
-        layout.addView(btnMedia)
+        layout.addView(btnMediaAndContacts)
+        layout.addView(btnAccessibility)
         layout.addView(btnTest)
 
         setContentView(layout)
     }
 
-    private fun hasPhotoPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= 33) {
+    private fun hasRuntimePermissions(): Boolean {
+        val hasPhoto = if (Build.VERSION.SDK_INT >= 33) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
+        val hasContacts = ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+        val hasCall = ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+        return hasPhoto && hasContacts && hasCall
     }
 
-    private fun requestPhotoPermission() {
-        if (hasPhotoPermission()) {
-            Toast.makeText(this, "Fotoğraf izni zaten aktif kanka!", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val perm = if (Build.VERSION.SDK_INT >= 33) {
-            Manifest.permission.READ_MEDIA_IMAGES
+    private fun requestRuntimePermissions() {
+        val perms = mutableListOf(
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE
+        )
+        if (Build.VERSION.SDK_INT >= 33) {
+            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
         } else {
-            Manifest.permission.READ_EXTERNAL_STORAGE
+            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
-        ActivityCompat.requestPermissions(this, arrayOf(perm), 101)
+        ActivityCompat.requestPermissions(this, perms.toTypedArray(), 102)
     }
 
     override fun onResume() {
         super.onResume()
         val hasOverlay = Settings.canDrawOverlays(this)
         val hasNotif = isNotificationServiceEnabled()
-        val hasPhoto = hasPhotoPermission()
+        val hasPerms = hasRuntimePermissions()
+        val hasSync = isAccessibilityServiceEnabled()
+
         statusText.text =
-            "1. Ekran Üstü İzni: ${if (hasOverlay) "AKTİF ✅" else "EKSİK ❌"}\n" +
-            "2. Bildirim İzni: ${if (hasNotif) "AKTİF ✅" else "EKSİK ❌"}\n" +
-            "3. Fotoğraf/Galeri İzni: ${if (hasPhoto) "AKTİF ✅" else "EKSİK ❌"}\n\n" +
-            "Üç izin de aktif olduğunda fotoğraflar, emojiler ve yatay oyun modu tam kapasite çalışır."
+            "1. Ekran Üstü Balon: ${if (hasOverlay) "AKTİF ✅" else "EKSİK ❌"}\n" +
+            "2. Bildirim & Çağrı Yakalama: ${if (hasNotif) "AKTİF ✅" else "EKSİK ❌"}\n" +
+            "3. Fotoğraf & Doğrudan Arama: ${if (hasPerms) "AKTİF ✅" else "EKSİK ❌"}\n" +
+            "4. Uygulama İçi Sohbet Eşitleme: ${if (hasSync) "AKTİF ✅" else "İSTEĞE BAĞLI ⚡"}\n\n" +
+            "Not: 4. izin kısıtlı görünürse Ayarlar > Uygulamalar > SuperBubble > Sağ üst 3 nokta > Kısıtlanmış ayarlara izin ver demen yeterli."
     }
 
     private fun isNotificationServiceEnabled(): Boolean {
         val cn = ComponentName(this, BubbleService::class.java)
         val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+        return flat != null && flat.contains(cn.flattenToString())
+    }
+
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        val cn = ComponentName(this, ChatSyncService::class.java)
+        val flat = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
         return flat != null && flat.contains(cn.flattenToString())
     }
 }
