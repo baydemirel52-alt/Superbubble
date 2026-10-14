@@ -3,6 +3,7 @@ package com.selim.superbubble
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.animation.ValueAnimator
+import android.app.ActivityOptions
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.RemoteInput
@@ -53,7 +54,16 @@ class BubbleService : NotificationListenerService() {
             "com.instagram.android"
         )
 
+        // Mesaj Durum Kodları
+        const val STATUS_SENT = 1      // ✓ (Gönderildi)
+        const val STATUS_DELIVERED = 2 // ✓✓ Gri (İletildi)
+        const val STATUS_READ = 3      // ✓✓ Mavi / Görüldü (Okundu)
+
         var instance: BubbleService? = null
+
+        // Instagram'da sohbet açılınca otomatik arama tuşuna basmak için geçici emir
+        var pendingInstaCallVideo: Boolean? = null
+        var pendingInstaCallTimestamp: Long = 0L
 
         fun spawnTestBubble(context: Context) {
             val srv = instance
@@ -72,7 +82,12 @@ class BubbleService : NotificationListenerService() {
                     pkgName = "com.whatsapp",
                     sender = "Test Sohbeti",
                     messagesBatch = listOf(
-                        ChatMessage("Kanka üstteki sesli ve görüntülü arama logolarına bak!", false, srv.nowTime())
+                        ChatMessage(
+                            text = "Kanka şimdi bir mesaj yaz, tiklerin (✓ -> ✓✓ -> Mavi ✓✓) nasıl değiştiğini canlı gör!",
+                            isMe = false,
+                            time = srv.nowTime(),
+                            status = STATUS_READ
+                        )
                     ),
                     appName = "WhatsApp",
                     avatar = null,
@@ -91,7 +106,8 @@ class BubbleService : NotificationListenerService() {
         val isMe: Boolean,
         val time: String,
         var imageBase64: String? = null,
-        val audioUri: String? = null
+        val audioUri: String? = null,
+        var status: Int = STATUS_DELIVERED // 1: Gönderildi, 2: İletildi, 3: Okundu/Görüldü
     )
 
     data class ChatSession(
@@ -180,7 +196,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // Arama kapandığında arama durumunu sıfırla
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         sbn ?: return
         val pkg = sbn.packageName
@@ -224,7 +239,7 @@ class BubbleService : NotificationListenerService() {
         val normalizedKey = "${pkg}_${cleanTitle.lowercase(Locale.getDefault())}"
         val avatar = extractAvatar(notif)
 
-        // ==================== 1. GELEN SESLİ / GÖRÜNTÜLÜ ARAMA KONTROLÜ ====================
+        // ==================== 1. GELEN ARAMA KONTROLÜ ====================
         val isCallNotif = notif.category == Notification.CATEGORY_CALL ||
                 notif.fullScreenIntent != null ||
                 isIncomingCallText(text) ||
@@ -251,10 +266,12 @@ class BubbleService : NotificationListenerService() {
             return
         }
 
-        // ==================== 2. NORMAL MESAJ & YANSIMA KONTROLÜ ====================
+        // ==================== 2. GÖNDERİLEN MESAJIN İLETİLDİ (✓✓) ONAYI ====================
         val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
         if (!remoteHistory.isNullOrEmpty()) {
-            scheduleCancelNotification(sbn.key, 400)
+            // WhatsApp/Instagram mesajı sunucuya ilettiğini onayladı -> Çift Gri Tik (✓✓) yap!
+            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
+            scheduleCancelNotification(sbn.key, 350)
             return
         }
 
@@ -274,7 +291,6 @@ class BubbleService : NotificationListenerService() {
         var photoBitmap: Bitmap? = extractPhotoFromNotification(notif, extras)
         var audioUriStr: String? = null
 
-        // Bildirim yığınındaki TÜM geçmiş ve yeni mesajları çek (Sadece son mesajı değil!)
         val extractedBatch = mutableListOf<ChatMessage>()
         val historicBundles = extras.getParcelableArray(Notification.EXTRA_HISTORIC_MESSAGES)
         val msgBundles = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
@@ -293,7 +309,8 @@ class BubbleService : NotificationListenerService() {
                         (selfName != null && lastSender.equals(selfName, true))
                     )
             ) {
-                scheduleCancelNotification(sbn.key, 400)
+                markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
+                scheduleCancelNotification(sbn.key, 350)
                 return
             }
 
@@ -328,7 +345,8 @@ class BubbleService : NotificationListenerService() {
                         isMe = isFromMe,
                         time = nowTime(),
                         imageBase64 = bitmapToBase64(itemBmp),
-                        audioUri = itemAudio
+                        audioUri = itemAudio,
+                        status = STATUS_READ
                     )
                 )
             }
@@ -338,14 +356,16 @@ class BubbleService : NotificationListenerService() {
         }
 
         if (text.startsWith("Siz:") || text.startsWith("Sen:") || text.startsWith("You:")) {
-            scheduleCancelNotification(sbn.key, 400)
+            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
+            scheduleCancelNotification(sbn.key, 350)
             return
         }
 
         val now = System.currentTimeMillis()
         recentSentTexts.entries.removeIf { now - it.value > 15000 }
         if (recentSentTexts.containsKey(text)) {
-            scheduleCancelNotification(sbn.key, 400)
+            markSessionMessagesStatus(normalizedKey, STATUS_DELIVERED)
+            scheduleCancelNotification(sbn.key, 350)
             return
         }
 
@@ -362,7 +382,8 @@ class BubbleService : NotificationListenerService() {
                     isMe = false,
                     time = nowTime(),
                     imageBase64 = bitmapToBase64(photoBitmap),
-                    audioUri = audioUriStr
+                    audioUri = audioUriStr,
+                    status = STATUS_READ
                 )
             )
         } else if (photoBitmap != null && extractedBatch.last().imageBase64 == null) {
@@ -403,8 +424,32 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // WhatsApp/Instagram uygulama içi sohbet ekranından okunan mesajları balon geçmişiyle eşitler
-    fun syncFromAppScreen(pkgName: String, title: String, screenMessages: List<Pair<String, Boolean>>) {
+    // Mesajların tik / görüldü durumunu günceller
+    fun markSessionMessagesStatus(chatKey: String, newStatus: Int) {
+        mainHandler.post {
+            val sess = activeSessions[chatKey] ?: return@post
+            var changed = false
+            for (m in sess.messages) {
+                if (m.isMe && m.status < newStatus) {
+                    m.status = newStatus
+                    changed = true
+                }
+            }
+            if (changed) {
+                saveMessagesToDisk(chatKey, sess.messages)
+                if (isExpanded && activeChatKey == chatKey) {
+                    refreshExpandedUI()
+                }
+            }
+        }
+    }
+
+    // Uygulama içi ekrandan (ChatSyncService) okunan mesajları ve Mavi Tik / Görüldü bilgisini eşitler
+    fun syncFromAppScreen(
+        pkgName: String,
+        title: String,
+        screenMessages: List<Triple<String, Boolean, Int>>
+    ) {
         val cleanTitle = title.trim()
         if (cleanTitle.isEmpty() || cleanTitle.equals("WhatsApp", true) || cleanTitle.equals("Instagram", true)) return
         val appName = if (pkgName.contains("instagram")) "Instagram" else "WhatsApp"
@@ -422,10 +467,22 @@ class BubbleService : NotificationListenerService() {
             }
 
             var changed = false
-            for ((msgText, isMe) in screenMessages) {
-                val exists = session.messages.any { it.text == msgText && it.isMe == isMe }
-                if (!exists) {
-                    session.messages.add(ChatMessage(text = msgText, isMe = isMe, time = nowTime()))
+            for ((msgText, isMe, detectedStatus) in screenMessages) {
+                val existing = session.messages.findLast { it.text == msgText && it.isMe == isMe }
+                if (existing != null) {
+                    if (isMe && detectedStatus > existing.status) {
+                        existing.status = detectedStatus
+                        changed = true
+                    }
+                } else {
+                    session.messages.add(
+                        ChatMessage(
+                            text = msgText,
+                            isMe = isMe,
+                            time = nowTime(),
+                            status = detectedStatus
+                        )
+                    )
                     changed = true
                 }
             }
@@ -457,19 +514,39 @@ class BubbleService : NotificationListenerService() {
         return notif.actions?.lastOrNull()?.actionIntent
     }
 
-    // ==================== DOĞRUDAN WHATSAPP SESLİ / GÖRÜNTÜLÜ ARAMA BAŞLATMA ====================
+    // S22 Ultra (Android 14/15/16) Arka Plan PendingIntent Engelini Aşan Fonksiyon!
+    private fun sendPendingIntentSafely(pi: PendingIntent?): Boolean {
+        if (pi == null) return false
+        return try {
+            val optionsBundle = if (Build.VERSION.SDK_INT >= 34) {
+                ActivityOptions.makeBasic()
+                    .setPendingIntentBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    )
+                    .toBundle()
+            } else {
+                null
+            }
+            pi.send(this, 0, null, null, null, null, optionsBundle)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    // ==================== WHATSAPP & INSTAGRAM SESLİ / GÖRÜNTÜLÜ ARAMA BAŞLATMA ====================
     private fun initiateCall(isVideo: Boolean) {
         val active = activeSessions[activeChatKey] ?: return
 
-        // Eğer o an gelen bir arama varsa direkt aramanın içine sok
+        // 1. Eğer o an çalan bir arama varsa direkt aramaya gir
         if (active.isIncomingCall && active.callIntent != null) {
-            try {
-                active.callIntent?.send()
+            if (sendPendingIntentSafely(active.callIntent)) {
                 collapseChat()
                 return
-            } catch (_: Exception) {}
+            }
         }
 
+        // 2. WhatsApp ise doğrudan Rehber (ContactsContract) üzerinden aramayı başlat
         if (active.pkgName.contains("whatsapp") &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
         ) {
@@ -494,12 +571,24 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        // Instagram veya rehberde eşleşmeyen numara ise direkt sohbet ekranına at
-        Toast.makeText(
-            this,
-            if (isVideo) "Görüntülü arama için sohbete geçiliyor..." else "Sesli arama için sohbete geçiliyor...",
-            Toast.LENGTH_SHORT
-        ).show()
+        // 3. Instagram (veya rehberde kayıtlı olmayan WhatsApp kişisi) için:
+        // Otomatik arama emrini kur, S22 Ultra izniyle direkt DM sohbetini aç ve arama ikonuna otomatik tıkla!
+        if (active.pkgName.contains("instagram")) {
+            pendingInstaCallVideo = isVideo
+            pendingInstaCallTimestamp = System.currentTimeMillis()
+            Toast.makeText(
+                this,
+                if (isVideo) "Instagram Görüntülü Arama başlatılıyor..." else "Instagram Sesli Arama başlatılıyor...",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else {
+            Toast.makeText(
+                this,
+                if (isVideo) "Görüntülü arama için sohbete geçiliyor..." else "Sesli arama için sohbete geçiliyor...",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
         openOriginalApp()
     }
 
@@ -525,7 +614,6 @@ class BubbleService : NotificationListenerService() {
         return null
     }
 
-    // ==================== MESSENGER TARZI VEKTÖREL ARAMA LOGOLARI ====================
     private fun createMessengerVectorIcon(isVideo: Boolean, onClick: () -> Unit): ImageView {
         val sizePx = dpToPx(36)
         val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
@@ -537,7 +625,6 @@ class BubbleService : NotificationListenerService() {
 
         val w = sizePx.toFloat()
         if (isVideo) {
-            // Messenger Görüntülü Arama Kamera Logosu
             val bodyRect = RectF(w * 0.16f, w * 0.28f, w * 0.64f, w * 0.72f)
             canvas.drawRoundRect(bodyRect, w * 0.10f, w * 0.10f, paint)
             val lensPath = Path().apply {
@@ -549,7 +636,6 @@ class BubbleService : NotificationListenerService() {
             }
             canvas.drawPath(lensPath, paint)
         } else {
-            // Messenger Sesli Arama Ahize Logosu
             val phonePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#0084FF")
                 style = Paint.Style.STROKE
@@ -751,7 +837,8 @@ class BubbleService : NotificationListenerService() {
                         isMe = obj.optBoolean("isMe", false),
                         time = obj.optString("time", ""),
                         imageBase64 = obj.optString("img", "").ifEmpty { null },
-                        audioUri = obj.optString("aud", "").ifEmpty { null }
+                        audioUri = obj.optString("aud", "").ifEmpty { null },
+                        status = obj.optInt("st", STATUS_DELIVERED)
                     )
                 )
             }
@@ -769,18 +856,12 @@ class BubbleService : NotificationListenerService() {
                 obj.put("text", m.text)
                 obj.put("isMe", m.isMe)
                 obj.put("time", m.time)
+                obj.put("st", m.status)
                 if (m.imageBase64 != null) obj.put("img", m.imageBase64)
                 if (m.audioUri != null) obj.put("aud", m.audioUri)
                 arr.put(obj)
             }
             prefs.edit().putString(chatKey, arr.toString()).apply()
-        } catch (_: Exception) {}
-    }
-
-    private fun clearSavedHistory(chatKey: String) {
-        try {
-            val prefs = getSharedPreferences("superbubble_history_db", Context.MODE_PRIVATE)
-            prefs.edit().remove(chatKey).apply()
         } catch (_: Exception) {}
     }
 
@@ -854,7 +935,10 @@ class BubbleService : NotificationListenerService() {
         session.isIncomingCall = isIncomingCall
 
         var addedNew = false
+        var hasIncomingFromOther = false
+
         for (incoming in messagesBatch) {
+            if (!incoming.isMe) hasIncomingFromOther = true
             val existing = session.messages.lastOrNull { it.text == incoming.text && it.isMe == incoming.isMe }
             if (existing != null) {
                 if (incoming.imageBase64 != null && existing.imageBase64 == null) {
@@ -864,6 +948,16 @@ class BubbleService : NotificationListenerService() {
             } else {
                 session.messages.add(incoming)
                 addedNew = true
+            }
+        }
+
+        // Karşı taraf bize yeni mesaj attıysa önceki tüm gönderdiğimiz mesajları OKUNDU (Mavi ✓✓ / Görüldü) yap!
+        if (hasIncomingFromOther) {
+            for (m in session.messages) {
+                if (m.isMe && m.status < STATUS_READ) {
+                    m.status = STATUS_READ
+                    addedNew = true
+                }
             }
         }
 
@@ -1048,15 +1142,13 @@ class BubbleService : NotificationListenerService() {
                 MotionEvent.ACTION_UP -> {
                     dismissBarView?.visibility = View.GONE
                     if (!isDragging) {
-                        // Eğer aktif bir gelen arama varsa balona tıklayınca direkt aramanın içine at!
                         val callingSession = activeSessions.values.firstOrNull { it.isIncomingCall && it.callIntent != null }
                         if (callingSession != null) {
-                            try {
-                                callingSession.callIntent?.send()
+                            if (sendPendingIntentSafely(callingSession.callIntent)) {
                                 callingSession.isIncomingCall = false
                                 refreshBubbleAppearance(callingSession)
                                 return@setOnTouchListener true
-                            } catch (_: Exception) {}
+                            }
                         }
                         openExpandedChat()
                     } else {
@@ -1105,7 +1197,6 @@ class BubbleService : NotificationListenerService() {
             bubbleInitialsTxt?.text = session.sender.take(1).uppercase()
         }
 
-        // Gelen arama varsa çerçeveyi yeşil yap ve telefon ikonu göster
         bubbleAvatarContainer?.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(Color.parseColor(if (session.isIncomingCall) "#00C853" else "#0084FF"))
@@ -1289,7 +1380,6 @@ class BubbleService : NotificationListenerService() {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#0084FF"))
             }
-            // Profile tıklayınca orijinal uygulamayı aç
             setOnClickListener { openOriginalApp() }
         }
 
@@ -1335,7 +1425,6 @@ class BubbleService : NotificationListenerService() {
         titleCol.addView(headerNameTxt)
         titleCol.addView(headerSubTxt)
 
-        // Messenger Tarzı Sesli Arama ve Görüntülü Arama Vektör Logoları
         val voiceCallIcon = createMessengerVectorIcon(isVideo = false) {
             initiateCall(isVideo = false)
         }
@@ -1364,7 +1453,6 @@ class BubbleService : NotificationListenerService() {
         cardHeader.addView(videoCallIcon)
         cardHeader.addView(openAppBtn)
 
-        // Gelen Arama Olduğunda Çıkan Yeşil Katılma Çubuğu
         incomingCallBanner = TextView(this).apply {
             text = "📞 GELEN ARAMA VAR • Katılmak İçin Dokun"
             textSize = 13f
@@ -1376,17 +1464,15 @@ class BubbleService : NotificationListenerService() {
             visibility = View.GONE
             setOnClickListener {
                 val active = activeSessions[activeChatKey]
-                try {
-                    active?.callIntent?.send() ?: active?.contentIntent?.send()
+                if (!sendPendingIntentSafely(active?.callIntent) && !sendPendingIntentSafely(active?.contentIntent)) {
+                    openOriginalApp()
+                } else {
                     active?.isIncomingCall = false
                     collapseChat()
-                } catch (_: Exception) {
-                    openOriginalApp()
                 }
             }
         }
 
-        // Mesaj Listesi
         messagesScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1414,7 +1500,6 @@ class BubbleService : NotificationListenerService() {
             visibility = View.GONE
         }
 
-        // --- ALT ÇUBUK ---
         val inputBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1728,22 +1813,42 @@ class BubbleService : NotificationListenerService() {
         fullScreenImageOverlay?.visibility = View.VISIBLE
     }
 
+    // S22 Ultra'da hem PendingIntent hem de doğrudan Paket Açma garantili uygulama başlatıcı
     private fun openOriginalApp() {
-        val active = activeSessions[activeChatKey]
+        val active = activeSessions[activeChatKey] ?: return
+        collapseChat()
+
+        // 1. Gelen arama varsa direkt çağrı ekranını aç
+        if (active.isIncomingCall && sendPendingIntentSafely(active.callIntent)) {
+            return
+        }
+
+        // 2. Bildirimin kendi sohbet bağlantısını S22 Ultra izniyle aç
+        if (sendPendingIntentSafely(active.contentIntent)) {
+            return
+        }
+
+        // 3. Eğer bildirim bağlantısı düşmüşse doğrudan Instagram DM / WhatsApp uygulamasını başlat
         try {
-            if (active?.isIncomingCall == true && active.callIntent != null) {
-                active.callIntent?.send()
-                collapseChat()
+            if (active.pkgName.contains("instagram")) {
+                val dmIntent = Intent(Intent.ACTION_VIEW, Uri.parse("instagram://direct-inbox")).apply {
+                    setPackage(active.pkgName)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(dmIntent)
                 return
             }
-            if (active?.contentIntent != null) {
-                active.contentIntent?.send()
-                collapseChat()
-            } else {
-                Toast.makeText(this, "Test balonudur kanka.", Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {}
+
+        try {
+            val launchIntent = packageManager.getLaunchIntentForPackage(active.pkgName)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (launchIntent != null) {
+                startActivity(launchIntent)
             }
         } catch (_: Exception) {
-            Toast.makeText(this, "Uygulama açılamadı.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Uygulama açılamadı kanka.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1862,17 +1967,19 @@ class BubbleService : NotificationListenerService() {
             headerInitialsTxt?.text = active.sender.take(1).uppercase()
         }
 
+        val isInsta = active.appName == "Instagram"
         headerNameTxt?.text = active.sender
-        // "Geçmiş Kayıtlı" yazısı kaldırıldı, sadece uygulama adı veya arama durumu yazar
         headerSubTxt?.text = if (active.isIncomingCall) "📞 Gelen Arama..." else active.appName
         headerSubTxt?.setTextColor(
-            Color.parseColor(if (active.appName == "Instagram") "#E1306C" else "#25D366")
+            Color.parseColor(if (isInsta) "#E1306C" else "#25D366")
         )
 
         incomingCallBanner?.visibility = if (active.isIncomingCall) View.VISIBLE else View.GONE
 
         messagesContainer?.removeAllViews()
-        active.messages.forEach { msg ->
+        val lastMyMsgIndex = active.messages.indexOfLast { it.isMe }
+
+        active.messages.forEachIndexed { index, msg ->
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(
@@ -1970,15 +2077,63 @@ class BubbleService : NotificationListenerService() {
                 bubbleBox.addView(reelBtn)
             }
 
+            // ==================== SAAT + WHATSAPP TİKLERİ (✓, ✓✓, Mavi ✓✓) & INSTAGRAM "GÖRÜLDÜ" ====================
+            val metaRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                setPadding(dpToPx(6), dpToPx(2), dpToPx(6), 0)
+            }
+
             val timeTxt = TextView(this).apply {
                 text = msg.time
                 textSize = 10f
                 setTextColor(Color.parseColor("#8A8D91"))
-                setPadding(dpToPx(6), dpToPx(2), dpToPx(6), 0)
+            }
+            metaRow.addView(timeTxt)
+
+            if (msg.isMe) {
+                if (isInsta) {
+                    // Instagram tarzı: Son gönderilen mesajın altında Gönderildi / İletildi / Görüldü yazar
+                    if (index == lastMyMsgIndex) {
+                        val igStatusTxt = TextView(this).apply {
+                            text = when (msg.status) {
+                                STATUS_SENT -> "  • Gönderildi"
+                                STATUS_DELIVERED -> "  • İletildi"
+                                else -> "  • Görüldü 👀"
+                            }
+                            textSize = 10.5f
+                            setTypeface(null, if (msg.status == STATUS_READ) Typeface.BOLD else Typeface.NORMAL)
+                            setTextColor(
+                                Color.parseColor(if (msg.status == STATUS_READ) "#53BDEB" else "#9EA2A8")
+                            )
+                        }
+                        metaRow.addView(igStatusTxt)
+                    }
+                } else {
+                    // WhatsApp tarzı: Her mesajın yanında ✓ (Gri), ✓✓ (Gri) veya ✓✓ (Mavi)
+                    val tickTxt = TextView(this).apply {
+                        text = if (msg.status == STATUS_SENT) "  ✓" else "  ✓✓"
+                        textSize = 11.5f
+                        setTypeface(null, Typeface.BOLD)
+                        setTextColor(
+                            Color.parseColor(
+                                when (msg.status) {
+                                    STATUS_READ -> "#53BDEB" // Parlak WhatsApp Mavi Tik Rengi
+                                    else -> "#9EA2A8"        // Gri Tik Rengi
+                                }
+                            )
+                        )
+                    }
+                    metaRow.addView(tickTxt)
+                }
             }
 
             row.addView(bubbleBox)
-            row.addView(timeTxt)
+            row.addView(metaRow)
             messagesContainer?.addView(row)
         }
 
@@ -1996,10 +2151,22 @@ class BubbleService : NotificationListenerService() {
         extraToolPanel?.visibility = View.GONE
 
         if (action == null) {
-            active.messages.add(ChatMessage(text = text, isMe = true, time = nowTime()))
+            // Test balonunda: Önce Tek Tik (✓), 1 sn sonra Çift Gri Tik (✓✓), 2.2 sn sonra Mavi Tik (✓✓) simülasyonu
+            val newMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
+            active.messages.add(newMsg)
             saveMessagesToDisk(active.key, active.messages)
             replyEdit?.setText("")
             refreshExpandedUI()
+
+            mainHandler.postDelayed({
+                newMsg.status = STATUS_DELIVERED
+                refreshExpandedUI()
+            }, 900)
+
+            mainHandler.postDelayed({
+                newMsg.status = STATUS_READ
+                refreshExpandedUI()
+            }, 2000)
             return
         }
 
@@ -2010,12 +2177,34 @@ class BubbleService : NotificationListenerService() {
                 bundle.putCharSequence(remoteInput.resultKey, text)
             }
             RemoteInput.addResultsToIntent(action.remoteInputs, intent, bundle)
-            action.actionIntent.send(this, 0, intent)
 
-            active.messages.add(ChatMessage(text = text, isMe = true, time = nowTime()))
+            val optionsBundle = if (Build.VERSION.SDK_INT >= 34) {
+                ActivityOptions.makeBasic()
+                    .setPendingIntentBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    )
+                    .toBundle()
+            } else null
+
+            action.actionIntent.send(this, 0, intent, null, null, null, optionsBundle)
+
+            // İlk gönderildiği salise Tek Tik (✓) olarak ekle
+            val sentMsg = ChatMessage(text = text, isMe = true, time = nowTime(), status = STATUS_SENT)
+            active.messages.add(sentMsg)
             saveMessagesToDisk(active.key, active.messages)
             replyEdit?.setText("")
             refreshExpandedUI()
+
+            // 1.1 saniye sonra iletildi (✓✓) olarak güncelle
+            mainHandler.postDelayed({
+                if (sentMsg.status < STATUS_DELIVERED) {
+                    sentMsg.status = STATUS_DELIVERED
+                    saveMessagesToDisk(active.key, active.messages)
+                    if (isExpanded && activeChatKey == active.key) {
+                        refreshExpandedUI()
+                    }
+                }
+            }, 1100)
 
             scheduleCancelNotification(active.sbnKey, 450)
         } catch (_: PendingIntent.CanceledException) {
@@ -2079,7 +2268,7 @@ class BubbleService : NotificationListenerService() {
     }
 }
 
-// ==================== UYGULAMA İÇİ SOHBET GEÇMİŞİNİ EŞİTLEYEN ERİŞİLEBİLİRLİK SERVİSİ ====================
+// ==================== UYGULAMA İÇİ SOHBET, MAVİ TİK, GÖRÜLDÜ VE INSTAGRAM ARAMA SERVİSİ ====================
 class ChatSyncService : AccessibilityService() {
 
     private var lastSyncTime = 0L
@@ -2089,22 +2278,35 @@ class ChatSyncService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         if (!BubbleService.TARGET_PACKAGES.contains(pkg)) return
 
+        val root = rootInActiveWindow ?: return
+
+        // 1. Eğer kullanıcı Instagram balonunda Sesli veya Görüntülü Arama tuşuna bastıysa (7 sn içinde)
+        // Instagram DM ekranı açılır açılmaz sağ üstteki Sesli/Görüntülü arama ikonuna otomatik tıkla!
+        if (pkg.contains("instagram") && BubbleService.pendingInstaCallVideo != null) {
+            val elapsed = System.currentTimeMillis() - BubbleService.pendingInstaCallTimestamp
+            if (elapsed < 7500) {
+                val wantVideo = BubbleService.pendingInstaCallVideo == true
+                if (tryClickInstagramCallButton(root, wantVideo)) {
+                    BubbleService.pendingInstaCallVideo = null
+                    return
+                }
+            } else {
+                BubbleService.pendingInstaCallVideo = null
+            }
+        }
+
         val now = System.currentTimeMillis()
-        if (now - lastSyncTime < 900) return
+        if (now - lastSyncTime < 850) return
         lastSyncTime = now
 
-        val root = rootInActiveWindow ?: return
         try {
             val screenWidth = resources.displayMetrics.widthPixels
-
-            // 1. WhatsApp / Instagram üst başlığındaki kişi adını bul
             val titleNode = findHeaderTitle(root, pkg) ?: return
             val chatTitle = titleNode.trim()
             if (chatTitle.isEmpty()) return
 
-            // 2. Ekrandaki görünür mesaj balonlarını (Konumu sağdaysa bizim, soldaysa karşı tarafın) topla
-            val messages = mutableListOf<Pair<String, Boolean>>()
-            collectMessagesFromNode(root, pkg, screenWidth, messages)
+            val messages = mutableListOf<Triple<String, Boolean, Int>>()
+            collectMessagesAndStatus(root, pkg, screenWidth, messages)
 
             if (messages.isNotEmpty()) {
                 BubbleService.instance?.syncFromAppScreen(pkg, chatTitle, messages)
@@ -2112,11 +2314,43 @@ class ChatSyncService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
+    private fun tryClickInstagramCallButton(root: AccessibilityNodeInfo, isVideo: Boolean): Boolean {
+        val keywords = if (isVideo) {
+            listOf("görüntülü arama", "görüntülü", "video call", "video")
+        } else {
+            listOf("sesli arama", "sesli", "audio call", "voice call", "ara")
+        }
+
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val desc = node.contentDescription?.toString()?.lowercase(Locale.getDefault()) ?: ""
+            if (desc.isNotEmpty() && keywords.any { desc.contains(it) }) {
+                if (node.isClickable) {
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    return true
+                } else if (node.parent?.isClickable == true) {
+                    node.parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    return true
+                }
+            }
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return false
+    }
+
     private fun findHeaderTitle(root: AccessibilityNodeInfo, pkg: String): String? {
         val idCandidates = if (pkg.contains("whatsapp")) {
             listOf("com.whatsapp:id/conversation_contact_name", "com.whatsapp.w4b:id/conversation_contact_name")
         } else {
-            listOf("com.instagram.android:id/thread_title", "com.instagram.android:id/action_bar_title")
+            listOf(
+                "com.instagram.android:id/thread_title",
+                "com.instagram.android:id/action_bar_title",
+                "com.instagram.android:id/header_title"
+            )
         }
 
         for (id in idCandidates) {
@@ -2129,13 +2363,15 @@ class ChatSyncService : AccessibilityService() {
         return null
     }
 
-    private fun collectMessagesFromNode(
+    private fun collectMessagesAndStatus(
         root: AccessibilityNodeInfo,
         pkg: String,
         screenWidth: Int,
-        outList: MutableList<Pair<String, Boolean>>
+        outList: MutableList<Triple<String, Boolean, Int>>
     ) {
         if (pkg.contains("whatsapp")) {
+            // WhatsApp'taki son tik durumunu kontrol et (Okundu / İletildi / Gönderildi)
+            val overallTickStatus = detectWhatsAppTickStatus(root)
             val idList = listOf("com.whatsapp:id/message_text", "com.whatsapp.w4b:id/message_text")
             for (id in idList) {
                 val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
@@ -2144,12 +2380,44 @@ class ChatSyncService : AccessibilityService() {
                     if (txt.isEmpty()) continue
                     val rect = Rect()
                     node.getBoundsInScreen(rect)
-                    // Mesaj kutusu ekranın sağ yarısına yakınsa gönderen biziz (isMe = true)
                     val isMe = rect.centerX() > (screenWidth * 0.50f) || rect.left > (screenWidth * 0.22f)
-                    outList.add(Pair(txt, isMe))
+                    val st = if (isMe) overallTickStatus else BubbleService.STATUS_READ
+                    outList.add(Triple(txt, isMe, st))
+                }
+            }
+        } else if (pkg.contains("instagram")) {
+            // Instagram'da ekranda "Görüldü" veya "Seen" yazısı var mı kontrol et
+            val isSeen = checkInstagramSeenText(root)
+            if (isSeen) {
+                val title = findHeaderTitle(root, pkg) ?: return
+                val key = "${pkg}_${title.trim().lowercase(Locale.getDefault())}"
+                BubbleService.instance?.markSessionMessagesStatus(key, BubbleService.STATUS_READ)
+            }
+        }
+    }
+
+    private fun detectWhatsAppTickStatus(root: AccessibilityNodeInfo): Int {
+        val statusIds = listOf("com.whatsapp:id/status", "com.whatsapp.w4b:id/status")
+        var latestStatus = BubbleService.STATUS_DELIVERED
+        for (id in statusIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
+            for (node in nodes) {
+                val desc = node.contentDescription?.toString()?.lowercase(Locale.getDefault()) ?: ""
+                if (desc.contains("okundu") || desc.contains("read") || desc.contains("görüldü")) {
+                    latestStatus = BubbleService.STATUS_READ
+                } else if (desc.contains("iletildi") || desc.contains("delivered")) {
+                    if (latestStatus < BubbleService.STATUS_DELIVERED) latestStatus = BubbleService.STATUS_DELIVERED
                 }
             }
         }
+        return latestStatus
+    }
+
+    private fun checkInstagramSeenText(root: AccessibilityNodeInfo): Boolean {
+        val seenNodes = root.findAccessibilityNodeInfosByText("Görüldü")
+        if (!seenNodes.isNullOrEmpty()) return true
+        val seenEnNodes = root.findAccessibilityNodeInfosByText("Seen")
+        return !seenEnNodes.isNullOrEmpty()
     }
 
     override fun onInterrupt() {}
