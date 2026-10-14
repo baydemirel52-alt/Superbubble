@@ -56,7 +56,6 @@ class BubbleService : NotificationListenerService() {
 
         var instance: BubbleService? = null
 
-        // Instagram'da sohbet açılınca otomatik arama tuşuna basmak için geçici emir
         var pendingInstaCallVideo: Boolean? = null
         var pendingInstaCallTimestamp: Long = 0L
 
@@ -78,7 +77,7 @@ class BubbleService : NotificationListenerService() {
                     sender = "Test Sohbeti",
                     messagesBatch = listOf(
                         ChatMessage(
-                            text = "Kanka tikler ve son görülme kaldırıldı. Her şey sade, net ve tam istediğin gibi!",
+                            text = "Kanka 🗑️ çöp kutusu butonu üst bara geri eklendi! Bastığında geçmişi anında sıfırlar.",
                             isMe = false,
                             time = srv.nowTime()
                         )
@@ -410,7 +409,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // Uygulama içi ekrandan (ChatSyncService) okunan mesajları balon geçmişine ekler
     fun syncFromAppScreen(
         pkgName: String,
         title: String,
@@ -569,7 +567,7 @@ class BubbleService : NotificationListenerService() {
     }
 
     private fun createMessengerVectorIcon(isVideo: Boolean, onClick: () -> Unit): ImageView {
-        val sizePx = dpToPx(34)
+        val sizePx = dpToPx(33)
         val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -613,7 +611,7 @@ class BubbleService : NotificationListenerService() {
 
         return ImageView(this).apply {
             layoutParams = LinearLayout.LayoutParams(sizePx, sizePx).apply {
-                rightMargin = dpToPx(6)
+                rightMargin = dpToPx(5)
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -814,6 +812,13 @@ class BubbleService : NotificationListenerService() {
                 arr.put(obj)
             }
             prefs.edit().putString(chatKey, arr.toString()).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun clearSavedHistory(chatKey: String) {
+        try {
+            val prefs = getSharedPreferences("superbubble_history_db", Context.MODE_PRIVATE)
+            prefs.edit().remove(chatKey).apply()
         } catch (_: Exception) {}
     }
 
@@ -1365,6 +1370,27 @@ class BubbleService : NotificationListenerService() {
         titleCol.addView(headerNameTxt)
         titleCol.addView(headerSubTxt)
 
+        // 🗑️ Sohbet Geçmişini Silme (Çöp Kutusu) Butonu
+        val clearHistoryBtn = TextView(this).apply {
+            text = "🗑️"
+            textSize = 13.5f
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dpToPx(33), dpToPx(33)).apply {
+                rightMargin = dpToPx(5)
+            }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#263951"))
+            }
+            setOnClickListener {
+                val active = activeSessions[activeChatKey] ?: return@setOnClickListener
+                active.messages.clear()
+                clearSavedHistory(active.key)
+                refreshExpandedUI()
+                Toast.makeText(this@BubbleService, "Konuşma geçmişi temizlendi", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         val voiceCallIcon = createMessengerVectorIcon(isVideo = false) {
             initiateCall(isVideo = false)
         }
@@ -1379,7 +1405,7 @@ class BubbleService : NotificationListenerService() {
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#4599FF"))
             gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(34), dpToPx(34))
+            layoutParams = LinearLayout.LayoutParams(dpToPx(33), dpToPx(33))
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#263951"))
@@ -1389,6 +1415,7 @@ class BubbleService : NotificationListenerService() {
 
         cardHeader.addView(headerAvatarBox)
         cardHeader.addView(titleCol)
+        cardHeader.addView(clearHistoryBtn)
         cardHeader.addView(voiceCallIcon)
         cardHeader.addView(videoCallIcon)
         cardHeader.addView(openAppBtn)
@@ -2011,7 +2038,6 @@ class BubbleService : NotificationListenerService() {
                 bubbleBox.addView(reelBtn)
             }
 
-            // Sadece sade saat gösterimi (Tik ve Görüldü kalabalığı kaldırıldı)
             val timeTxt = TextView(this).apply {
                 text = msg.time
                 textSize = 10f
@@ -2142,7 +2168,6 @@ class ChatSyncService : AccessibilityService() {
 
         val root = rootInActiveWindow ?: return
 
-        // Instagram Otomatik Sesli / Görüntülü Arama Tıklayıcı
         if (pkg.contains("instagram") && BubbleService.pendingInstaCallVideo != null) {
             val elapsed = System.currentTimeMillis() - BubbleService.pendingInstaCallTimestamp
             if (elapsed < 7500) {
