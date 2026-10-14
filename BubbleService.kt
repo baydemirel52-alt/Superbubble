@@ -1,27 +1,38 @@
 package com.selim.superbubble
 
+import android.Manifest
 import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.RemoteInput
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Parcelable
+import android.provider.MediaStore
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Base64
 import android.util.TypedValue
 import android.view.*
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -54,23 +65,23 @@ class BubbleService : NotificationListenerService() {
                 return
             }
             srv.mainHandler.post {
-                // Test için örnek bir resimli ve normal mesaj oluştur
-                val sampleBmp = Bitmap.createBitmap(300, 180, Bitmap.Config.ARGB_8888).apply {
+                val sampleBmp = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
                     val c = Canvas(this)
-                    c.drawColor(Color.parseColor("#1E3A8A"))
+                    c.drawColor(Color.parseColor("#005C4B"))
                     val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         color = Color.WHITE
-                        textSize = 28f
+                        textSize = 26f
                         typeface = Typeface.DEFAULT_BOLD
                     }
-                    c.drawText("📸 Örnek Fotoğraf", 35f, 100f, p)
+                    c.drawText("📷 Örnek Fotoğraf (Tıkla)", 20f, 100f, p)
                 }
 
                 srv.onNewMessage(
                     chatKey = "test_messenger",
                     sbnKey = null,
+                    pkgName = "com.whatsapp",
                     sender = "Test Sohbeti",
-                    message = "Kanka geçmiş kaydı, fotoğraf gösterme ve bildirim silme eklendi! Fotoğrafa tıklayıp büyütebilirsin.",
+                    message = "Kanka yatay oyun modu, 😀 emoji, 📷 fotoğraf ve 🎤 ses butonları eklendi!",
                     appName = "WhatsApp",
                     avatar = null,
                     photoBitmap = sampleBmp,
@@ -87,13 +98,14 @@ class BubbleService : NotificationListenerService() {
         val text: String,
         val isMe: Boolean,
         val time: String,
-        val imageBase64: String? = null,
+        var imageBase64: String? = null,
         val audioUri: String? = null
     )
 
     data class ChatSession(
         val key: String,
         var sbnKey: String? = null,
+        var pkgName: String = "com.whatsapp",
         var sender: String,
         val appName: String,
         val messages: MutableList<ChatMessage> = mutableListOf(),
@@ -108,9 +120,9 @@ class BubbleService : NotificationListenerService() {
     private val activeSessions = LinkedHashMap<String, ChatSession>()
     private var activeChatKey: String? = null
 
-    // Kendi gönderdiğimiz mesajların bildirim yansımasını engellemek için kayıt listesi
     private val recentSentTexts = LinkedHashMap<String, Long>()
     private var mediaPlayer: MediaPlayer? = null
+    private var speechRecognizer: SpeechRecognizer? = null
 
     // 1. Küçük Yüzen Balon
     private var bubbleView: FrameLayout? = null
@@ -133,6 +145,7 @@ class BubbleService : NotificationListenerService() {
     private var headerSubTxt: TextView? = null
     private var messagesContainer: LinearLayout? = null
     private var messagesScroll: ScrollView? = null
+    private var extraToolPanel: FrameLayout? = null
     private var replyEdit: EditText? = null
     private var fullScreenImageOverlay: FrameLayout? = null
     private lateinit var expandedParams: WindowManager.LayoutParams
@@ -148,8 +161,31 @@ class BubbleService : NotificationListenerService() {
     override fun onDestroy() {
         super.onDestroy()
         stopAudio()
+        destroySpeech()
         destroyAllOverlays()
         instance = null
+    }
+
+    // Telefon yatay (oyun/film) veya dikey çevrildiğinde pencereyi otomatik uyarla!
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        mainHandler.post {
+            val metrics = resources.displayMetrics
+            if (bubbleView != null) {
+                bubbleParams.x = metrics.widthPixels - dpToPx(74)
+                bubbleParams.y = metrics.heightPixels / 4
+                try {
+                    windowManager.updateViewLayout(bubbleView, bubbleParams)
+                } catch (_: Exception) {}
+            }
+            if (isExpanded) {
+                // Yatay/Dikey geçişte pencere boyutunu yeni ekrana göre yeniden kur
+                val currentKey = activeChatKey
+                collapseChat()
+                activeChatKey = currentKey
+                openExpandedChat()
+            }
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -163,10 +199,9 @@ class BubbleService : NotificationListenerService() {
 
         val extras = notif.extras
 
-        // Kendi gönderdiğimiz yanıtın bildirim güncellemesi mi? (Çift balon hatasını %100 önler)
         val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
         if (!remoteHistory.isNullOrEmpty()) {
-            scheduleCancelNotification(sbn.key, 500)
+            scheduleCancelNotification(sbn.key, 400)
             return
         }
 
@@ -174,7 +209,6 @@ class BubbleService : NotificationListenerService() {
         val convTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
         val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim() ?: return
 
-        // "(2 mesaj)" gibi ekleri temizle ki aynı kişi için ayrı balon açılmasın
         val cleanTitle = (convTitle ?: rawTitle)
             .replace(Regex("\\s*\\(\\d+\\s*mesaj\\)", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s*\\(\\d+\\s*new messages\\)", RegexOption.IGNORE_CASE), "")
@@ -185,7 +219,6 @@ class BubbleService : NotificationListenerService() {
             ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim()
             ?: return
 
-        // Sistem mesajlarını ve kendi adımızı taşıyan yansımaları filtrele
         if (text.contains("Yeni mesajlar kontrol ediliyor", ignoreCase = true) ||
             text.contains("WhatsApp Web", ignoreCase = true) ||
             cleanTitle.equals("WhatsApp", ignoreCase = true) ||
@@ -196,8 +229,8 @@ class BubbleService : NotificationListenerService() {
             (selfName != null && cleanTitle.equals(selfName, ignoreCase = true))
         ) return
 
-        // MessagingStyle içindeki son mesajı ve medyayı kontrol et
-        var photoBitmap: Bitmap? = extras.get(Notification.EXTRA_PICTURE) as? Bitmap
+        // 6 Katmanlı Fotoğraf ve Ses Yakalayıcı
+        var photoBitmap: Bitmap? = extractPhotoFromNotification(notif, extras)
         var audioUriStr: String? = null
 
         val msgBundles = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
@@ -208,7 +241,6 @@ class BubbleService : NotificationListenerService() {
                 val msgText = lastBundle.getCharSequence("text")?.toString()?.trim()
                 if (!msgText.isNullOrEmpty()) text = msgText
 
-                // Eğer son mesajı gönderen biz isek (balondan yanıtladıysak) yoksay ve üst bildirimi sil
                 if (senderPerson != null && (
                             senderPerson.equals("Siz", true) ||
                             senderPerson.equals("Sen", true) ||
@@ -216,34 +248,39 @@ class BubbleService : NotificationListenerService() {
                             (selfName != null && senderPerson.equals(selfName, true))
                         )
                 ) {
-                    scheduleCancelNotification(sbn.key, 500)
+                    scheduleCancelNotification(sbn.key, 400)
                     return
                 }
+            }
 
-                // Bildirim içindeki fotoğraf veya ses URI'sini yakala
-                val mimeType = lastBundle.getString("type") ?: ""
-                val dataUri = lastBundle.getParcelable<Parcelable>("uri") as? Uri
-                if (dataUri != null) {
-                    if (mimeType.startsWith("image/") && photoBitmap == null) {
-                        photoBitmap = loadBitmapFromUri(dataUri)
-                    } else if (mimeType.startsWith("audio/")) {
-                        audioUriStr = dataUri.toString()
-                    }
+            // Tüm mesaj paketlerini sondan başa tara, resim veya ses URI'si varsa çek
+            for (i in msgBundles.indices.reversed()) {
+                val b = msgBundles[i] as? Bundle ?: continue
+                val mime = b.getString("type") ?: ""
+                val u = b.getParcelable<Parcelable>("uri") as? Uri ?: continue
+                if (mime.startsWith("image/") && photoBitmap == null) {
+                    photoBitmap = loadBitmapFromUri(u)
+                } else if (mime.startsWith("audio/") && audioUriStr == null) {
+                    audioUriStr = u.toString()
                 }
             }
         }
 
         if (text.startsWith("Siz:") || text.startsWith("Sen:") || text.startsWith("You:")) {
-            scheduleCancelNotification(sbn.key, 500)
+            scheduleCancelNotification(sbn.key, 400)
             return
         }
 
-        // Son 15 saniye içinde bizim balondan gönderdiğimiz metinle birebir aynıysa (yansıma ise) yoksay
         val now = System.currentTimeMillis()
         recentSentTexts.entries.removeIf { now - it.value > 15000 }
         if (recentSentTexts.containsKey(text)) {
-            scheduleCancelNotification(sbn.key, 500)
+            scheduleCancelNotification(sbn.key, 400)
             return
+        }
+
+        // Eğer mesaj "Bir fotoğraf gönderdi" / "Fotoğraf" diyor ama bildirimde resim yoksa galeriden son inen WhatsApp/IG resmini kontrol et
+        if (photoBitmap == null && isPhotoMessageText(text)) {
+            photoBitmap = fetchLatestReceivedPhoto(40)
         }
 
         val replyAction = findReplyAction(notif) ?: return
@@ -255,6 +292,7 @@ class BubbleService : NotificationListenerService() {
             onNewMessage(
                 chatKey = normalizedKey,
                 sbnKey = sbn.key,
+                pkgName = pkg,
                 sender = cleanTitle,
                 message = text,
                 appName = appName,
@@ -264,10 +302,135 @@ class BubbleService : NotificationListenerService() {
                 replyAction = replyAction,
                 contentIntent = notif.contentIntent
             )
+
+            // WhatsApp fotoğrafı bildirime 1 saniye gecikmeli indirirse diye 1.2 sn sonra tekrar kontrol et
+            if (photoBitmap == null && isPhotoMessageText(text)) {
+                mainHandler.postDelayed({
+                    val delayedBmp = fetchLatestReceivedPhoto(25)
+                    if (delayedBmp != null) {
+                        val sess = activeSessions[normalizedKey]
+                        val last = sess?.messages?.lastOrNull()
+                        if (last != null && !last.isMe && last.imageBase64 == null) {
+                            last.imageBase64 = bitmapToBase64(delayedBmp)
+                            saveMessagesToDisk(normalizedKey, sess.messages)
+                            if (isExpanded && activeChatKey == normalizedKey) {
+                                refreshExpandedUI()
+                            }
+                        }
+                    }
+                }, 1200)
+            }
         }
     }
 
-    private fun scheduleCancelNotification(sbnKey: String?, delayMs: Long = 300) {
+    @Suppress("DEPRECATION")
+    private fun extractPhotoFromNotification(notif: Notification, extras: Bundle): Bitmap? {
+        try {
+            // 1. EXTRA_PICTURE (Bitmap veya Icon)
+            val picObj = extras.get(Notification.EXTRA_PICTURE)
+            if (picObj is Bitmap) return picObj
+            if (Build.VERSION.SDK_INT >= 23 && picObj is Icon) {
+                iconToBitmap(picObj)?.let { return it }
+            }
+
+            // 2. EXTRA_PICTURE_ICON (Android 13/14/15/16 S22 Ultra standardı)
+            val picIconObj = extras.get("android.pictureIcon")
+            if (Build.VERSION.SDK_INT >= 23 && picIconObj is Icon) {
+                iconToBitmap(picIconObj)?.let { return it }
+            }
+
+            // 3. EXTRA_LARGE_ICON_BIG
+            val bigLarge = extras.get(Notification.EXTRA_LARGE_ICON_BIG)
+            if (bigLarge is Bitmap) return bigLarge
+            if (Build.VERSION.SDK_INT >= 23 && bigLarge is Icon) {
+                iconToBitmap(bigLarge)?.let { return it }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    private fun iconToBitmap(icon: Icon): Bitmap? {
+        return try {
+            val d = icon.loadDrawable(this) ?: return null
+            val w = max(1, if (d.intrinsicWidth > 0) d.intrinsicWidth else 300)
+            val h = max(1, if (d.intrinsicHeight > 0) d.intrinsicHeight else 300)
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            d.setBounds(0, 0, canvas.width, canvas.height)
+            d.draw(canvas)
+            bmp
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun hasPhotoPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    // WhatsApp'ın galerideki klasörüne yeni düşen fotoğrafı yakalar
+    private fun fetchLatestReceivedPhoto(maxAgeSeconds: Long): Bitmap? {
+        if (!hasPhotoPermission()) return null
+        return try {
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DATE_ADDED
+            )
+            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                    val id = cursor.getLong(idCol)
+                    val dateAdded = cursor.getLong(dateCol)
+                    val nowSec = System.currentTimeMillis() / 1000
+                    if (nowSec - dateAdded <= maxAgeSeconds) {
+                        val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                        return loadBitmapFromUri(uri)
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // Balon içinden fotoğraf göndermek için son galeri fotoğraflarını getirir
+    private fun getRecentGalleryPhotos(limit: Int = 10): List<Uri> {
+        val list = mutableListOf<Uri>()
+        if (!hasPhotoPermission()) return list
+        try {
+            val projection = arrayOf(MediaStore.Images.Media._ID)
+            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                while (cursor.moveToNext() && list.size < limit) {
+                    val id = cursor.getLong(idCol)
+                    list.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id))
+                }
+            }
+        } catch (_: Exception) {}
+        return list
+    }
+
+    private fun scheduleCancelNotification(sbnKey: String?, delayMs: Long = 250) {
         if (sbnKey == null) return
         mainHandler.postDelayed({
             try {
@@ -289,7 +452,7 @@ class BubbleService : NotificationListenerService() {
     private fun bitmapToBase64(bmp: Bitmap?): String? {
         if (bmp == null) return null
         return try {
-            val maxDim = 480
+            val maxDim = 460
             val ratio = min(maxDim.toFloat() / bmp.width, maxDim.toFloat() / bmp.height)
             val scaled = if (ratio < 1f) {
                 Bitmap.createScaledBitmap(
@@ -318,7 +481,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== KALICI SOHBET GEÇMİŞİ (SHARED PREFERENCES) ====================
     private fun loadSavedMessages(chatKey: String): MutableList<ChatMessage> {
         val list = mutableListOf<ChatMessage>()
         try {
@@ -345,7 +507,6 @@ class BubbleService : NotificationListenerService() {
         try {
             val prefs = getSharedPreferences("superbubble_history_db", Context.MODE_PRIVATE)
             val arr = JSONArray()
-            // Son 45 mesajı kalıcı olarak sakla
             val slice = if (messages.size > 45) messages.takeLast(45) else messages
             for (m in slice) {
                 val obj = JSONObject()
@@ -406,6 +567,7 @@ class BubbleService : NotificationListenerService() {
     private fun onNewMessage(
         chatKey: String,
         sbnKey: String?,
+        pkgName: String,
         sender: String,
         message: String,
         appName: String,
@@ -416,10 +578,10 @@ class BubbleService : NotificationListenerService() {
         contentIntent: PendingIntent?
     ) {
         val session = activeSessions.getOrPut(chatKey) {
-            // Pencere daha önce kapatılmış olsa bile eski geçmişi diskten geri yükle!
             val history = loadSavedMessages(chatKey)
             ChatSession(
                 key = chatKey,
+                pkgName = pkgName,
                 sender = sender,
                 appName = appName,
                 messages = history
@@ -427,6 +589,7 @@ class BubbleService : NotificationListenerService() {
         }
 
         session.sender = sender
+        session.pkgName = pkgName
         if (sbnKey != null) session.sbnKey = sbnKey
         if (avatar != null) session.avatar = avatar
         if (replyAction != null) session.replyAction = replyAction
@@ -435,7 +598,13 @@ class BubbleService : NotificationListenerService() {
         val imgB64 = bitmapToBase64(photoBitmap)
         val lastMsg = session.messages.lastOrNull()
 
-        if (lastMsg == null || lastMsg.isMe || lastMsg.text != message || (imgB64 != null && lastMsg.imageBase64 == null)) {
+        if (lastMsg != null && !lastMsg.isMe && lastMsg.text == message) {
+            // Aynı mesajın fotoğrafı yeni yüklendiyse mevcut mesaja resmi ekle
+            if (imgB64 != null && lastMsg.imageBase64 == null) {
+                lastMsg.imageBase64 = imgB64
+                saveMessagesToDisk(chatKey, session.messages)
+            }
+        } else {
             session.messages.add(
                 ChatMessage(
                     text = message,
@@ -450,7 +619,6 @@ class BubbleService : NotificationListenerService() {
             if (!isExpanded || activeChatKey != chatKey) {
                 session.unreadCount++
             } else {
-                // Sohbet zaten açıksa üstteki bildirimi anında temizle
                 scheduleCancelNotification(session.sbnKey, 200)
             }
         }
@@ -619,7 +787,7 @@ class BubbleService : NotificationListenerService() {
                     }
                     if (isDragging) {
                         bubbleParams.x = max(0, min(metrics.widthPixels - dpToPx(68), startX + dx))
-                        bubbleParams.y = max(dpToPx(36), min(metrics.heightPixels - dpToPx(90), startY + dy))
+                        bubbleParams.y = max(dpToPx(24), min(metrics.heightPixels - dpToPx(80), startY + dy))
                         windowManager.updateViewLayout(bubbleView, bubbleParams)
                     }
                     true
@@ -630,7 +798,6 @@ class BubbleService : NotificationListenerService() {
                         openExpandedChat()
                     } else {
                         if (event.rawY > metrics.heightPixels * 0.82f) {
-                            // Sadece ekrandaki balonu kapat, diskteki geçmişi SİLME!
                             activeSessions.clear()
                             destroyAllOverlays()
                         } else {
@@ -692,7 +859,7 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ ====================
+    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ (DİKEY & YATAY OYUN MODU UYUMLU) ====================
     private fun openExpandedChat() {
         if (isExpanded || activeSessions.isEmpty()) return
         isExpanded = true
@@ -700,6 +867,8 @@ class BubbleService : NotificationListenerService() {
         bubbleView?.visibility = View.GONE
 
         val metrics = resources.displayMetrics
+        val isLandscape = metrics.widthPixels > metrics.heightPixels
+
         expandedParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -719,6 +888,10 @@ class BubbleService : NotificationListenerService() {
                         fullScreenImageOverlay?.visibility = View.GONE
                         return true
                     }
+                    if (extraToolPanel?.visibility == View.VISIBLE) {
+                        extraToolPanel?.visibility = View.GONE
+                        return true
+                    }
                     collapseChat()
                     return true
                 }
@@ -728,16 +901,31 @@ class BubbleService : NotificationListenerService() {
             setOnClickListener { collapseChat() }
         }
 
+        // Yatay (Oyun/Film) modunda ekranı boydan boya kapatmasın, ortada kibar dursun!
+        val cardWidth = if (isLandscape) {
+            min(dpToPx(440), (metrics.widthPixels * 0.65f).toInt())
+        } else {
+            WindowManager.LayoutParams.MATCH_PARENT
+        }
+
+        val cardHeight = if (isLandscape) {
+            (metrics.heightPixels * 0.74f).toInt()
+        } else {
+            (metrics.heightPixels * 0.50f).toInt()
+        }
+
         val mainColumn = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
+                cardWidth,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
             ).apply {
-                topMargin = dpToPx(36)
-                leftMargin = dpToPx(12)
-                rightMargin = dpToPx(12)
+                topMargin = if (isLandscape) dpToPx(8) else dpToPx(34)
+                if (!isLandscape) {
+                    leftMargin = dpToPx(12)
+                    rightMargin = dpToPx(12)
+                }
             }
             isClickable = true
         }
@@ -748,8 +936,8 @@ class BubbleService : NotificationListenerService() {
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dpToPx(62)
-            ).apply { bottomMargin = dpToPx(8) }
+                if (isLandscape) dpToPx(46) else dpToPx(58)
+            ).apply { bottomMargin = dpToPx(6) }
         }
 
         topHeadsContainer = LinearLayout(this).apply {
@@ -760,10 +948,10 @@ class BubbleService : NotificationListenerService() {
 
         val minimizePill = TextView(this).apply {
             text = "Küçült ⬇"
-            textSize = 13f
+            textSize = 12.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
-            setPadding(dpToPx(14), dpToPx(8), dpToPx(14), dpToPx(8))
+            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#3A3B3C"))
                 cornerRadius = dpToPx(18).toFloat()
@@ -773,11 +961,12 @@ class BubbleService : NotificationListenerService() {
 
         val closeAllPill = TextView(this).apply {
             text = "✕"
-            textSize = 15f
+            textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(38), dpToPx(38)).apply {
+            val btnSize = if (isLandscape) dpToPx(34) else dpToPx(38)
+            layoutParams = LinearLayout.LayoutParams(btnSize, btnSize).apply {
                 leftMargin = dpToPx(8)
             }
             background = GradientDrawable().apply {
@@ -785,7 +974,6 @@ class BubbleService : NotificationListenerService() {
                 setColor(Color.parseColor("#FF3B30"))
             }
             setOnClickListener {
-                // Sadece ekrandaki pencereyi kapatır, geçmişi silmez!
                 activeSessions.clear()
                 destroyAllOverlays()
             }
@@ -796,7 +984,6 @@ class BubbleService : NotificationListenerService() {
         topBar.addView(closeAllPill)
 
         // --- ORTA BÖLÜM: SOHBET KARTI ---
-        val cardHeight = (metrics.heightPixels * 0.46f).toInt()
         val chatCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
@@ -811,10 +998,11 @@ class BubbleService : NotificationListenerService() {
             elevation = dpToPx(12).toFloat()
         }
 
+        val vPad = if (isLandscape) dpToPx(6) else dpToPx(10)
         val cardHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpToPx(14), dpToPx(10), dpToPx(14), dpToPx(10))
+            setPadding(dpToPx(12), vPad, dpToPx(12), vPad)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#242526"))
                 cornerRadii = floatArrayOf(
@@ -825,8 +1013,9 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
+        val avSize = if (isLandscape) dpToPx(34) else dpToPx(40)
         val headerAvatarBox = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dpToPx(40), dpToPx(40))
+            layoutParams = LinearLayout.LayoutParams(avSize, avSize)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#0084FF"))
@@ -839,13 +1028,13 @@ class BubbleService : NotificationListenerService() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
             gravity = Gravity.CENTER
-            textSize = 16f
+            textSize = 15f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
         }
 
         headerAvatarImg = ImageView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dpToPx(40), dpToPx(40))
+            layoutParams = FrameLayout.LayoutParams(avSize, avSize)
             scaleType = ImageView.ScaleType.CENTER_CROP
         }
 
@@ -860,46 +1049,43 @@ class BubbleService : NotificationListenerService() {
         }
 
         headerNameTxt = TextView(this).apply {
-            textSize = 15f
+            textSize = if (isLandscape) 14f else 15f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             maxLines = 1
         }
 
         headerSubTxt = TextView(this).apply {
-            textSize = 11f
+            textSize = 10.5f
             setTextColor(Color.parseColor("#00A884"))
         }
 
         titleCol.addView(headerNameTxt)
         titleCol.addView(headerSubTxt)
 
-        // Geçmişi Temizle Butonu
         val clearHistoryBtn = TextView(this).apply {
             text = "🗑️"
             textSize = 14f
-            setPadding(dpToPx(8), dpToPx(6), dpToPx(8), dpToPx(6))
+            setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
             setOnClickListener {
                 val active = activeSessions[activeChatKey] ?: return@setOnClickListener
                 active.messages.clear()
                 clearSavedHistory(active.key)
                 refreshExpandedUI()
-                Toast.makeText(this@BubbleService, "Bu sohbetin geçmişi temizlendi", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@BubbleService, "Sohbet geçmişi temizlendi", Toast.LENGTH_SHORT).show()
             }
         }
 
         val openAppBtn = TextView(this).apply {
             text = "Uygulama ↗"
-            textSize = 11.5f
+            textSize = 11f
             setTextColor(Color.parseColor("#4599FF"))
-            setPadding(dpToPx(10), dpToPx(6), dpToPx(10), dpToPx(6))
+            setPadding(dpToPx(10), dpToPx(5), dpToPx(10), dpToPx(5))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#263951"))
                 cornerRadius = dpToPx(12).toFloat()
             }
-            setOnClickListener {
-                openOriginalApp()
-            }
+            setOnClickListener { openOriginalApp() }
         }
 
         cardHeader.addView(headerAvatarBox)
@@ -907,13 +1093,14 @@ class BubbleService : NotificationListenerService() {
         cardHeader.addView(clearHistoryBtn)
         cardHeader.addView(openAppBtn)
 
+        // Mesaj Listesi
         messagesScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
             )
-            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
+            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
         }
 
         messagesContainer = LinearLayout(this).apply {
@@ -925,10 +1112,21 @@ class BubbleService : NotificationListenerService() {
         }
         messagesScroll?.addView(messagesContainer)
 
+        // Açılır Emoji / Fotoğraf / Ses Araç Paneli
+        extraToolPanel = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            setBackgroundColor(Color.parseColor("#202124"))
+            visibility = View.GONE
+        }
+
+        // --- ALT ÇUBUK: 😀 EMOJİ + 📷 FOTOĞRAF + MESAJ YAZ + 🎤 SES + ➤ GÖNDER ---
         val inputBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(10))
+            setPadding(dpToPx(8), vPad, dpToPx(8), vPad)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#242526"))
                 cornerRadii = floatArrayOf(
@@ -939,18 +1137,30 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
+        val emojiBtn = createActionIconButton("😀") {
+            toggleEmojiPanel()
+        }
+
+        val photoBtn = createActionIconButton("📷") {
+            togglePhotoPickerPanel()
+        }
+
         replyEdit = EditText(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, dpToPx(44), 1f)
+            val h = if (isLandscape) dpToPx(38) else dpToPx(42)
+            layoutParams = LinearLayout.LayoutParams(0, h, 1f).apply {
+                leftMargin = dpToPx(4)
+                rightMargin = dpToPx(4)
+            }
             hint = "Mesaj yaz..."
             setHintTextColor(Color.parseColor("#8A8D91"))
             setTextColor(Color.WHITE)
-            textSize = 14.5f
+            textSize = 14f
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_SEND
-            setPadding(dpToPx(16), 0, dpToPx(16), 0)
+            setPadding(dpToPx(14), 0, dpToPx(14), 0)
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#3A3B3C"))
-                cornerRadius = dpToPx(22).toFloat()
+                cornerRadius = dpToPx(21).toFloat()
             }
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_SEND) {
@@ -960,13 +1170,18 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
+        val voiceBtn = createActionIconButton("🎤") {
+            toggleVoicePanel()
+        }
+
         val sendCircleBtn = TextView(this).apply {
             text = "➤"
-            textSize = 18f
+            textSize = 16f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(dpToPx(44), dpToPx(44)).apply {
-                leftMargin = dpToPx(8)
+            val s = if (isLandscape) dpToPx(38) else dpToPx(42)
+            layoutParams = LinearLayout.LayoutParams(s, s).apply {
+                leftMargin = dpToPx(4)
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -975,17 +1190,20 @@ class BubbleService : NotificationListenerService() {
             setOnClickListener { sendMessageNow() }
         }
 
+        inputBar.addView(emojiBtn)
+        inputBar.addView(photoBtn)
         inputBar.addView(replyEdit)
+        inputBar.addView(voiceBtn)
         inputBar.addView(sendCircleBtn)
 
         chatCard.addView(cardHeader)
         chatCard.addView(messagesScroll)
+        chatCard.addView(extraToolPanel)
         chatCard.addView(inputBar)
 
         mainColumn.addView(topBar)
         mainColumn.addView(chatCard)
 
-        // Fotoğrafa tıklanınca tam ekran büyüten katman
         fullScreenImageOverlay = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1000,8 +1218,215 @@ class BubbleService : NotificationListenerService() {
         expandedOverlayView?.addView(fullScreenImageOverlay)
 
         windowManager.addView(expandedOverlayView, expandedParams)
-
         refreshExpandedUI()
+    }
+
+    private fun createActionIconButton(symbol: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = symbol
+            textSize = 17f
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dpToPx(36), dpToPx(36)).apply {
+                rightMargin = dpToPx(2)
+            }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#3A3B3C"))
+            }
+            setOnClickListener { onClick() }
+        }
+    }
+
+    // ==================== 😀 EMOJİ PANELİ ====================
+    private fun toggleEmojiPanel() {
+        val panel = extraToolPanel ?: return
+        if (panel.visibility == View.VISIBLE && panel.tag == "EMOJI") {
+            panel.visibility = View.GONE
+            return
+        }
+        panel.removeAllViews()
+        panel.tag = "EMOJI"
+
+        val emojis = listOf(
+            "😂", "❤️", "👍", "🔥", "😍", "🙏", "😭", "😎",
+            "🤔", "👏", "🎉", "💯", "🥰", "🤣", "😅", "👌",
+            "💪", "🙌", "😘", "👀", "😡", "😱", "🌹", "✨"
+        )
+
+        val scroll = HorizontalScrollView(this).apply {
+            setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        emojis.forEach { emo ->
+            val tv = TextView(this).apply {
+                text = emo
+                textSize = 22f
+                setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
+                setOnClickListener {
+                    replyEdit?.append(emo)
+                }
+            }
+            row.addView(tv)
+        }
+
+        scroll.addView(row)
+        panel.addView(scroll)
+        panel.visibility = View.VISIBLE
+    }
+
+    // ==================== 📷 FOTOĞRAF GÖNDERME PANELİ ====================
+    private fun togglePhotoPickerPanel() {
+        val panel = extraToolPanel ?: return
+        if (panel.visibility == View.VISIBLE && panel.tag == "PHOTO") {
+            panel.visibility = View.GONE
+            return
+        }
+        panel.removeAllViews()
+        panel.tag = "PHOTO"
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
+        }
+
+        val recentUris = getRecentGalleryPhotos(10)
+        if (recentUris.isEmpty()) {
+            val info = TextView(this).apply {
+                text = "Galeriden hızlı fotoğraf seçmek için SuperBubble ana ekranından 3. İzin (Fotoğraf İzni) butonuna bas kanka."
+                textSize = 12f
+                setTextColor(Color.LTGRAY)
+                setPadding(0, 0, 0, dpToPx(6))
+            }
+            container.addView(info)
+        } else {
+            val hint = TextView(this).apply {
+                text = "📷 Göndermek istediğin fotoğrafa dokun:"
+                textSize = 11.5f
+                setTextColor(Color.LTGRAY)
+                setPadding(0, 0, 0, dpToPx(6))
+            }
+            container.addView(hint)
+
+            val hScroll = HorizontalScrollView(this)
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+            recentUris.forEach { uri ->
+                val bmp = loadBitmapFromUri(uri)
+                if (bmp != null) {
+                    val img = ImageView(this).apply {
+                        layoutParams = LinearLayout.LayoutParams(dpToPx(68), dpToPx(68)).apply {
+                            rightMargin = dpToPx(8)
+                        }
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        setImageBitmap(bmp)
+                        setOnClickListener {
+                            sharePhotoToActiveApp(uri)
+                        }
+                    }
+                    row.addView(img)
+                }
+            }
+            hScroll.addView(row)
+            container.addView(hScroll)
+        }
+
+        panel.addView(container)
+        panel.visibility = View.VISIBLE
+    }
+
+    private fun sharePhotoToActiveApp(uri: Uri) {
+        val active = activeSessions[activeChatKey] ?: return
+        try {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/*"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                setPackage(active.pkgName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            collapseChat()
+            startActivity(shareIntent)
+        } catch (_: Exception) {
+            openOriginalApp()
+        }
+    }
+
+    // ==================== 🎤 SES KAYDI & SESLE YAZMA PANELİ ====================
+    private fun toggleVoicePanel() {
+        val panel = extraToolPanel ?: return
+        if (panel.visibility == View.VISIBLE && panel.tag == "VOICE") {
+            panel.visibility = View.GONE
+            return
+        }
+        panel.removeAllViews()
+        panel.tag = "VOICE"
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
+        }
+
+        val voiceToTextBtn = TextView(this).apply {
+            text = "🎙️ Konuşarak Yazdır"
+            textSize = 12.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = dpToPx(6)
+            }
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#0084FF"))
+                cornerRadius = dpToPx(14).toFloat()
+            }
+            setOnClickListener {
+                startVoiceDictation()
+            }
+        }
+
+        val directVoiceNoteBtn = TextView(this).apply {
+            text = "🔊 Ses Kaydı At ↗"
+            textSize = 12.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#00A884"))
+                cornerRadius = dpToPx(14).toFloat()
+            }
+            setOnClickListener {
+                openOriginalApp()
+            }
+        }
+
+        row.addView(voiceToTextBtn)
+        row.addView(directVoiceNoteBtn)
+        panel.addView(row)
+        panel.visibility = View.VISIBLE
+    }
+
+    private fun startVoiceDictation() {
+        replyEdit?.requestFocus()
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(replyEdit, InputMethodManager.SHOW_IMPLICIT)
+        Toast.makeText(
+            this,
+            "Klavyenin üstündeki mikrofon 🎙️ simgesine basıp konuş kanka, direkt buradan gönderir!",
+            Toast.LENGTH_LONG
+        ).show()
+    }
+
+    private fun destroySpeech() {
+        try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
     }
 
     private fun showFullScreenPhoto(bmp: Bitmap) {
@@ -1027,7 +1452,7 @@ class BubbleService : NotificationListenerService() {
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply { topMargin = dpToPx(45) }
+            ).apply { topMargin = dpToPx(30) }
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#AA333333"))
                 cornerRadius = dpToPx(20).toFloat()
@@ -1080,6 +1505,11 @@ class BubbleService : NotificationListenerService() {
         mediaPlayer = null
     }
 
+    private fun isPhotoMessageText(txt: String): Boolean {
+        val lower = txt.lowercase(Locale.getDefault())
+        return lower.contains("📷") || lower.contains("fotoğraf") || lower.contains("photo") || lower.contains("resim") || lower.contains("görsel")
+    }
+
     private fun isVoiceMessageText(txt: String): Boolean {
         val lower = txt.lowercase(Locale.getDefault())
         return lower.contains("🎤") || lower.contains("sesli mesaj") || lower.contains("voice message") || lower.contains("ses gönderdi")
@@ -1087,7 +1517,7 @@ class BubbleService : NotificationListenerService() {
 
     private fun isReelOrVideoText(txt: String): Boolean {
         val lower = txt.lowercase(Locale.getDefault())
-        return lower.contains("reel") || lower.contains("비디오") || lower.contains("video gönderdi") ||
+        return lower.contains("reel") || lower.contains("video gönderdi") ||
                 lower.contains("instagram.com/reel") || lower.contains("bir gönderi paylaştı")
     }
 
@@ -1098,15 +1528,16 @@ class BubbleService : NotificationListenerService() {
         activeChatKey = active.key
         active.unreadCount = 0
 
-        // Balonu açıp okuduğumuz an üstteki sistem bildirimini ve '1' simgesini otomatik sil!
         scheduleCancelNotification(active.sbnKey, 150)
 
-        // Üstteki yuvarlak sohbet kafaları
+        val isLandscape = resources.displayMetrics.widthPixels > resources.displayMetrics.heightPixels
+        val headDim = if (isLandscape) dpToPx(42) else dpToPx(52)
+
         topHeadsContainer?.removeAllViews()
         activeSessions.values.forEach { sess ->
             val isSelected = sess.key == activeChatKey
             val headFrame = FrameLayout(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dpToPx(52), dpToPx(52)).apply {
+                layoutParams = LinearLayout.LayoutParams(headDim, headDim).apply {
                     rightMargin = dpToPx(8)
                 }
                 background = GradientDrawable().apply {
@@ -1127,7 +1558,7 @@ class BubbleService : NotificationListenerService() {
 
             if (sess.avatar != null) {
                 val img = ImageView(this).apply {
-                    layoutParams = FrameLayout.LayoutParams(dpToPx(48), dpToPx(48), Gravity.CENTER)
+                    layoutParams = FrameLayout.LayoutParams(headDim - dpToPx(4), headDim - dpToPx(4), Gravity.CENTER)
                     setImageBitmap(sess.avatar)
                 }
                 headFrame.addView(img)
@@ -1139,7 +1570,7 @@ class BubbleService : NotificationListenerService() {
                     )
                     gravity = Gravity.CENTER
                     text = sess.sender.take(1).uppercase()
-                    textSize = 17f
+                    textSize = 15f
                     setTypeface(null, Typeface.BOLD)
                     setTextColor(Color.WHITE)
                 }
@@ -1165,7 +1596,6 @@ class BubbleService : NotificationListenerService() {
             Color.parseColor(if (active.appName == "Instagram") "#E1306C" else "#25D366")
         )
 
-        // Mesajları Çiz
         messagesContainer?.removeAllViews()
         active.messages.forEach { msg ->
             val row = LinearLayout(this).apply {
@@ -1173,7 +1603,7 @@ class BubbleService : NotificationListenerService() {
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dpToPx(6) }
+                ).apply { topMargin = dpToPx(5) }
                 gravity = if (msg.isMe) Gravity.END else Gravity.START
             }
 
@@ -1186,11 +1616,10 @@ class BubbleService : NotificationListenerService() {
                 }
             }
 
-            // 1. Eğer Fotoğraf Varsa Balonun İçinde Göster
             val bmp = base64ToBitmap(msg.imageBase64)
             if (bmp != null) {
                 val photoView = ImageView(this).apply {
-                    layoutParams = LinearLayout.LayoutParams(dpToPx(200), dpToPx(140)).apply {
+                    layoutParams = LinearLayout.LayoutParams(dpToPx(200), dpToPx(135)).apply {
                         bottomMargin = dpToPx(6)
                     }
                     scaleType = ImageView.ScaleType.CENTER_CROP
@@ -1198,18 +1627,35 @@ class BubbleService : NotificationListenerService() {
                     setOnClickListener { showFullScreenPhoto(bmp) }
                 }
                 bubbleBox.addView(photoView)
+            } else if (!msg.isMe && isPhotoMessageText(msg.text)) {
+                // Eğer fotoğraf gizliyse veya henüz galeriye inmediyse tıklanabilir buton göster
+                val openPhotoBtn = TextView(this).apply {
+                    text = "📷 Fotoğrafı Gör ↗"
+                    textSize = 12.5f
+                    setTypeface(null, Typeface.BOLD)
+                    setTextColor(Color.WHITE)
+                    setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { bottomMargin = dpToPx(6) }
+                    background = GradientDrawable().apply {
+                        setColor(Color.parseColor("#0084FF"))
+                        cornerRadius = dpToPx(14).toFloat()
+                    }
+                    setOnClickListener { openOriginalApp() }
+                }
+                bubbleBox.addView(openPhotoBtn)
             }
 
-            // 2. Mesaj Metni
             val msgTxt = TextView(this).apply {
                 text = msg.text
                 textSize = 14f
                 setTextColor(Color.WHITE)
-                maxWidth = dpToPx(235)
+                maxWidth = dpToPx(240)
             }
             bubbleBox.addView(msgTxt)
 
-            // 3. Ses Kaydı veya Instagram Reels ise Özel Oynatma Butonu Ekle
             if (msg.audioUri != null || isVoiceMessageText(msg.text)) {
                 val audioBtn = TextView(this).apply {
                     text = if (msg.audioUri != null) "▶️ Ses Kaydını Dinle" else "🎤 Ses Kaydını Aç ↗"
@@ -1272,8 +1718,8 @@ class BubbleService : NotificationListenerService() {
         val active = activeSessions[activeChatKey] ?: return
         val action = active.replyAction
 
-        // Kendi gönderdiğimiz mesajı kaydet ki bildirim yansıması çift balon açmasın
         recentSentTexts[text] = System.currentTimeMillis()
+        extraToolPanel?.visibility = View.GONE
 
         if (action == null) {
             active.messages.add(ChatMessage(text = text, isMe = true, time = nowTime()))
@@ -1297,7 +1743,6 @@ class BubbleService : NotificationListenerService() {
             replyEdit?.setText("")
             refreshExpandedUI()
 
-            // Cevap gönderildikten hemen sonra üstteki sistem bildirimini otomatik kapat
             scheduleCancelNotification(active.sbnKey, 450)
         } catch (_: PendingIntent.CanceledException) {
             Toast.makeText(
@@ -1323,6 +1768,7 @@ class BubbleService : NotificationListenerService() {
         }
         expandedOverlayView = null
         fullScreenImageOverlay = null
+        extraToolPanel = null
 
         bubbleView?.visibility = View.VISIBLE
         activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
@@ -1336,6 +1782,7 @@ class BubbleService : NotificationListenerService() {
         }
         expandedOverlayView = null
         fullScreenImageOverlay = null
+        extraToolPanel = null
 
         bubbleView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
