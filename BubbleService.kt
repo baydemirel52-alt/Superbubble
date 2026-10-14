@@ -1,6 +1,7 @@
 package com.selim.superbubble
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityService
 import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.PendingIntent
@@ -20,15 +21,15 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Parcelable
+import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Base64
 import android.util.TypedValue
 import android.view.*
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
@@ -46,13 +47,13 @@ import kotlin.math.min
 class BubbleService : NotificationListenerService() {
 
     companion object {
-        private val TARGET_PACKAGES = setOf(
+        val TARGET_PACKAGES = setOf(
             "com.whatsapp",
             "com.whatsapp.w4b",
             "com.instagram.android"
         )
 
-        private var instance: BubbleService? = null
+        var instance: BubbleService? = null
 
         fun spawnTestBubble(context: Context) {
             val srv = instance
@@ -65,29 +66,20 @@ class BubbleService : NotificationListenerService() {
                 return
             }
             srv.mainHandler.post {
-                val sampleBmp = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
-                    val c = Canvas(this)
-                    c.drawColor(Color.parseColor("#005C4B"))
-                    val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.WHITE
-                        textSize = 26f
-                        typeface = Typeface.DEFAULT_BOLD
-                    }
-                    c.drawText("📷 Örnek Fotoğraf (Tıkla)", 20f, 100f, p)
-                }
-
                 srv.onNewMessage(
                     chatKey = "test_messenger",
                     sbnKey = null,
                     pkgName = "com.whatsapp",
                     sender = "Test Sohbeti",
-                    message = "Kanka yatay oyun modu, 😀 emoji, 📷 fotoğraf ve 🎤 ses butonları eklendi!",
+                    messagesBatch = listOf(
+                        ChatMessage("Kanka üstteki sesli ve görüntülü arama logolarına bak!", false, srv.nowTime())
+                    ),
                     appName = "WhatsApp",
                     avatar = null,
-                    photoBitmap = sampleBmp,
-                    audioUri = null,
                     replyAction = null,
-                    contentIntent = null
+                    contentIntent = null,
+                    callIntent = null,
+                    isIncomingCall = false
                 )
                 Toast.makeText(context, "Balon hazır kanka!", Toast.LENGTH_SHORT).show()
             }
@@ -112,20 +104,22 @@ class BubbleService : NotificationListenerService() {
         var avatar: Bitmap? = null,
         var replyAction: Notification.Action? = null,
         var contentIntent: PendingIntent? = null,
+        var callIntent: PendingIntent? = null,
+        var isIncomingCall: Boolean = false,
         var unreadCount: Int = 0
     )
 
     private lateinit var windowManager: WindowManager
-    private val mainHandler = Handler(Looper.getMainLooper())
+    val mainHandler = Handler(Looper.getMainLooper())
     private val activeSessions = LinkedHashMap<String, ChatSession>()
     private var activeChatKey: String? = null
 
     private val recentSentTexts = LinkedHashMap<String, Long>()
     private var mediaPlayer: MediaPlayer? = null
-    private var speechRecognizer: SpeechRecognizer? = null
 
     // 1. Küçük Yüzen Balon
     private var bubbleView: FrameLayout? = null
+    private var bubbleAvatarContainer: FrameLayout? = null
     private var bubbleAvatarImg: ImageView? = null
     private var bubbleInitialsTxt: TextView? = null
     private var bubbleAppBadge: TextView? = null
@@ -139,6 +133,7 @@ class BubbleService : NotificationListenerService() {
     // 3. Açık Messenger Sohbet Penceresi
     private var expandedOverlayView: FrameLayout? = null
     private var topHeadsContainer: LinearLayout? = null
+    private var incomingCallBanner: TextView? = null
     private var headerAvatarImg: ImageView? = null
     private var headerInitialsTxt: TextView? = null
     private var headerNameTxt: TextView? = null
@@ -161,12 +156,10 @@ class BubbleService : NotificationListenerService() {
     override fun onDestroy() {
         super.onDestroy()
         stopAudio()
-        destroySpeech()
         destroyAllOverlays()
         instance = null
     }
 
-    // Telefon yatay (oyun/film) veya dikey çevrildiğinde pencereyi otomatik uyarla!
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         mainHandler.post {
@@ -179,11 +172,27 @@ class BubbleService : NotificationListenerService() {
                 } catch (_: Exception) {}
             }
             if (isExpanded) {
-                // Yatay/Dikey geçişte pencere boyutunu yeni ekrana göre yeniden kur
                 val currentKey = activeChatKey
                 collapseChat()
                 activeChatKey = currentKey
                 openExpandedChat()
+            }
+        }
+    }
+
+    // Arama kapandığında arama durumunu sıfırla
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        sbn ?: return
+        val pkg = sbn.packageName
+        if (!TARGET_PACKAGES.contains(pkg)) return
+        mainHandler.post {
+            activeSessions.values.forEach { sess ->
+                if (sess.sbnKey == sbn.key && sess.isIncomingCall) {
+                    sess.isIncomingCall = false
+                    sess.callIntent = null
+                    refreshBubbleAppearance(sess)
+                    if (isExpanded) refreshExpandedUI()
+                }
             }
         }
     }
@@ -198,14 +207,6 @@ class BubbleService : NotificationListenerService() {
         if ((notif.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
 
         val extras = notif.extras
-
-        val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
-        if (!remoteHistory.isNullOrEmpty()) {
-            scheduleCancelNotification(sbn.key, 400)
-            return
-        }
-
-        val selfName = extras.getCharSequence(Notification.EXTRA_SELF_DISPLAY_NAME)?.toString()?.trim()
         val convTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
         val rawTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim() ?: return
 
@@ -217,9 +218,50 @@ class BubbleService : NotificationListenerService() {
 
         var text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
             ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim()
-            ?: return
+            ?: ""
 
-        if (text.contains("Yeni mesajlar kontrol ediliyor", ignoreCase = true) ||
+        val appName = if (pkg.contains("instagram")) "Instagram" else "WhatsApp"
+        val normalizedKey = "${pkg}_${cleanTitle.lowercase(Locale.getDefault())}"
+        val avatar = extractAvatar(notif)
+
+        // ==================== 1. GELEN SESLİ / GÖRÜNTÜLÜ ARAMA KONTROLÜ ====================
+        val isCallNotif = notif.category == Notification.CATEGORY_CALL ||
+                notif.fullScreenIntent != null ||
+                isIncomingCallText(text) ||
+                isIncomingCallText(rawTitle)
+
+        if (isCallNotif) {
+            val targetCallIntent = notif.contentIntent ?: notif.fullScreenIntent ?: findAcceptCallIntent(notif)
+            val callDesc = if (text.isNotEmpty()) "📞 $text" else "📞 Gelen Arama..."
+            mainHandler.post {
+                onNewMessage(
+                    chatKey = normalizedKey,
+                    sbnKey = sbn.key,
+                    pkgName = pkg,
+                    sender = cleanTitle,
+                    messagesBatch = listOf(ChatMessage(callDesc, false, nowTime())),
+                    appName = appName,
+                    avatar = avatar,
+                    replyAction = null,
+                    contentIntent = notif.contentIntent,
+                    callIntent = targetCallIntent,
+                    isIncomingCall = true
+                )
+            }
+            return
+        }
+
+        // ==================== 2. NORMAL MESAJ & YANSIMA KONTROLÜ ====================
+        val remoteHistory = extras.getCharSequenceArray(Notification.EXTRA_REMOTE_INPUT_HISTORY)
+        if (!remoteHistory.isNullOrEmpty()) {
+            scheduleCancelNotification(sbn.key, 400)
+            return
+        }
+
+        val selfName = extras.getCharSequence(Notification.EXTRA_SELF_DISPLAY_NAME)?.toString()?.trim()
+
+        if (text.isEmpty() ||
+            text.contains("Yeni mesajlar kontrol ediliyor", ignoreCase = true) ||
             text.contains("WhatsApp Web", ignoreCase = true) ||
             cleanTitle.equals("WhatsApp", ignoreCase = true) ||
             cleanTitle.equals("Instagram", ignoreCase = true) ||
@@ -229,40 +271,69 @@ class BubbleService : NotificationListenerService() {
             (selfName != null && cleanTitle.equals(selfName, ignoreCase = true))
         ) return
 
-        // 6 Katmanlı Fotoğraf ve Ses Yakalayıcı
         var photoBitmap: Bitmap? = extractPhotoFromNotification(notif, extras)
         var audioUriStr: String? = null
 
+        // Bildirim yığınındaki TÜM geçmiş ve yeni mesajları çek (Sadece son mesajı değil!)
+        val extractedBatch = mutableListOf<ChatMessage>()
+        val historicBundles = extras.getParcelableArray(Notification.EXTRA_HISTORIC_MESSAGES)
         val msgBundles = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
-        if (!msgBundles.isNullOrEmpty()) {
-            val lastBundle = msgBundles.last() as? Bundle
-            if (lastBundle != null) {
-                val senderPerson = lastBundle.getCharSequence("sender")?.toString()?.trim()
-                val msgText = lastBundle.getCharSequence("text")?.toString()?.trim()
-                if (!msgText.isNullOrEmpty()) text = msgText
 
-                if (senderPerson != null && (
-                            senderPerson.equals("Siz", true) ||
-                            senderPerson.equals("Sen", true) ||
-                            senderPerson.equals("You", true) ||
-                            (selfName != null && senderPerson.equals(selfName, true))
-                        )
-                ) {
-                    scheduleCancelNotification(sbn.key, 400)
-                    return
-                }
+        val allBundles = mutableListOf<Parcelable>()
+        if (historicBundles != null) allBundles.addAll(historicBundles)
+        if (msgBundles != null) allBundles.addAll(msgBundles)
+
+        if (allBundles.isNotEmpty()) {
+            val lastBundle = allBundles.last() as? Bundle
+            val lastSender = lastBundle?.getCharSequence("sender")?.toString()?.trim()
+            if (lastSender != null && (
+                        lastSender.equals("Siz", true) ||
+                        lastSender.equals("Sen", true) ||
+                        lastSender.equals("You", true) ||
+                        (selfName != null && lastSender.equals(selfName, true))
+                    )
+            ) {
+                scheduleCancelNotification(sbn.key, 400)
+                return
             }
 
-            // Tüm mesaj paketlerini sondan başa tara, resim veya ses URI'si varsa çek
-            for (i in msgBundles.indices.reversed()) {
-                val b = msgBundles[i] as? Bundle ?: continue
+            for (i in allBundles.indices) {
+                val b = allBundles[i] as? Bundle ?: continue
+                val bSender = b.getCharSequence("sender")?.toString()?.trim()
+                val bText = b.getCharSequence("text")?.toString()?.trim() ?: continue
+                val isFromMe = bSender != null && (
+                        bSender.equals("Siz", true) ||
+                        bSender.equals("Sen", true) ||
+                        bSender.equals("You", true) ||
+                        (selfName != null && bSender.equals(selfName, true))
+                        )
+
+                var itemBmp: Bitmap? = null
+                var itemAudio: String? = null
                 val mime = b.getString("type") ?: ""
-                val u = b.getParcelable<Parcelable>("uri") as? Uri ?: continue
-                if (mime.startsWith("image/") && photoBitmap == null) {
-                    photoBitmap = loadBitmapFromUri(u)
-                } else if (mime.startsWith("audio/") && audioUriStr == null) {
-                    audioUriStr = u.toString()
+                val u = b.getParcelable<Parcelable>("uri") as? Uri
+                if (u != null) {
+                    if (mime.startsWith("image/")) {
+                        itemBmp = loadBitmapFromUri(u)
+                        if (photoBitmap == null) photoBitmap = itemBmp
+                    } else if (mime.startsWith("audio/")) {
+                        itemAudio = u.toString()
+                        if (audioUriStr == null) audioUriStr = itemAudio
+                    }
                 }
+
+                extractedBatch.add(
+                    ChatMessage(
+                        text = bText,
+                        isMe = isFromMe,
+                        time = nowTime(),
+                        imageBase64 = bitmapToBase64(itemBmp),
+                        audioUri = itemAudio
+                    )
+                )
+            }
+            if (extractedBatch.isNotEmpty()) {
+                text = extractedBatch.last().text
             }
         }
 
@@ -278,15 +349,25 @@ class BubbleService : NotificationListenerService() {
             return
         }
 
-        // Eğer mesaj "Bir fotoğraf gönderdi" / "Fotoğraf" diyor ama bildirimde resim yoksa galeriden son inen WhatsApp/IG resmini kontrol et
         if (photoBitmap == null && isPhotoMessageText(text)) {
             photoBitmap = fetchLatestReceivedPhoto(40)
         }
 
         val replyAction = findReplyAction(notif) ?: return
-        val avatar = extractAvatar(notif)
-        val appName = if (pkg.contains("instagram")) "Instagram" else "WhatsApp"
-        val normalizedKey = "${pkg}_${cleanTitle.lowercase(Locale.getDefault())}"
+
+        if (extractedBatch.isEmpty()) {
+            extractedBatch.add(
+                ChatMessage(
+                    text = text,
+                    isMe = false,
+                    time = nowTime(),
+                    imageBase64 = bitmapToBase64(photoBitmap),
+                    audioUri = audioUriStr
+                )
+            )
+        } else if (photoBitmap != null && extractedBatch.last().imageBase64 == null) {
+            extractedBatch.last().imageBase64 = bitmapToBase64(photoBitmap)
+        }
 
         mainHandler.post {
             onNewMessage(
@@ -294,16 +375,15 @@ class BubbleService : NotificationListenerService() {
                 sbnKey = sbn.key,
                 pkgName = pkg,
                 sender = cleanTitle,
-                message = text,
+                messagesBatch = extractedBatch,
                 appName = appName,
                 avatar = avatar,
-                photoBitmap = photoBitmap,
-                audioUri = audioUriStr,
                 replyAction = replyAction,
-                contentIntent = notif.contentIntent
+                contentIntent = notif.contentIntent,
+                callIntent = null,
+                isIncomingCall = false
             )
 
-            // WhatsApp fotoğrafı bildirime 1 saniye gecikmeli indirirse diye 1.2 sn sonra tekrar kontrol et
             if (photoBitmap == null && isPhotoMessageText(text)) {
                 mainHandler.postDelayed({
                     val delayedBmp = fetchLatestReceivedPhoto(25)
@@ -323,23 +403,201 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
+    // WhatsApp/Instagram uygulama içi sohbet ekranından okunan mesajları balon geçmişiyle eşitler
+    fun syncFromAppScreen(pkgName: String, title: String, screenMessages: List<Pair<String, Boolean>>) {
+        val cleanTitle = title.trim()
+        if (cleanTitle.isEmpty() || cleanTitle.equals("WhatsApp", true) || cleanTitle.equals("Instagram", true)) return
+        val appName = if (pkgName.contains("instagram")) "Instagram" else "WhatsApp"
+        val chatKey = "${pkgName}_${cleanTitle.lowercase(Locale.getDefault())}"
+
+        mainHandler.post {
+            val session = activeSessions.getOrPut(chatKey) {
+                ChatSession(
+                    key = chatKey,
+                    pkgName = pkgName,
+                    sender = cleanTitle,
+                    appName = appName,
+                    messages = loadSavedMessages(chatKey)
+                )
+            }
+
+            var changed = false
+            for ((msgText, isMe) in screenMessages) {
+                val exists = session.messages.any { it.text == msgText && it.isMe == isMe }
+                if (!exists) {
+                    session.messages.add(ChatMessage(text = msgText, isMe = isMe, time = nowTime()))
+                    changed = true
+                }
+            }
+
+            if (changed) {
+                saveMessagesToDisk(chatKey, session.messages)
+                if (isExpanded && activeChatKey == chatKey) {
+                    refreshExpandedUI()
+                }
+            }
+        }
+    }
+
+    private fun isIncomingCallText(txt: String): Boolean {
+        val lower = txt.lowercase(Locale.getDefault())
+        return lower.contains("sesli arama") || lower.contains("görüntülü arama") ||
+                lower.contains("gelen arama") || lower.contains("arıyor") ||
+                lower.contains("voice call") || lower.contains("video call") ||
+                lower.contains("incoming call")
+    }
+
+    private fun findAcceptCallIntent(notif: Notification): PendingIntent? {
+        notif.actions?.forEach { act ->
+            val t = act.title?.toString()?.lowercase(Locale.getDefault()) ?: ""
+            if (t.contains("cevapla") || t.contains("yanıtla") || t.contains("kabul") || t.contains("answer") || t.contains("accept")) {
+                return act.actionIntent
+            }
+        }
+        return notif.actions?.lastOrNull()?.actionIntent
+    }
+
+    // ==================== DOĞRUDAN WHATSAPP SESLİ / GÖRÜNTÜLÜ ARAMA BAŞLATMA ====================
+    private fun initiateCall(isVideo: Boolean) {
+        val active = activeSessions[activeChatKey] ?: return
+
+        // Eğer o an gelen bir arama varsa direkt aramanın içine sok
+        if (active.isIncomingCall && active.callIntent != null) {
+            try {
+                active.callIntent?.send()
+                collapseChat()
+                return
+            } catch (_: Exception) {}
+        }
+
+        if (active.pkgName.contains("whatsapp") &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+        ) {
+            val mimeType = if (isVideo) {
+                "vnd.android.cursor.item/vnd.com.whatsapp.video.call"
+            } else {
+                "vnd.android.cursor.item/vnd.com.whatsapp.voip.call"
+            }
+
+            val dataId = findWhatsAppCallDataId(active.sender, mimeType)
+            if (dataId != null) {
+                try {
+                    val callIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(Uri.parse("content://com.android.contacts/data/$dataId"), mimeType)
+                        setPackage(active.pkgName)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    collapseChat()
+                    startActivity(callIntent)
+                    return
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Instagram veya rehberde eşleşmeyen numara ise direkt sohbet ekranına at
+        Toast.makeText(
+            this,
+            if (isVideo) "Görüntülü arama için sohbete geçiliyor..." else "Sesli arama için sohbete geçiliyor...",
+            Toast.LENGTH_SHORT
+        ).show()
+        openOriginalApp()
+    }
+
+    private fun findWhatsAppCallDataId(senderName: String, mimeType: String): Long? {
+        val stripped = senderName.replace(Regex("[^\\p{L}\\p{N}\\s]"), "").trim()
+        val candidates = listOf(senderName.trim(), stripped).filter { it.isNotEmpty() }.distinct()
+
+        for (queryName in candidates) {
+            try {
+                contentResolver.query(
+                    ContactsContract.Data.CONTENT_URI,
+                    arrayOf(ContactsContract.Data._ID),
+                    "${ContactsContract.Data.MIMETYPE} = ? AND ${ContactsContract.Data.DISPLAY_NAME} LIKE ?",
+                    arrayOf(mimeType, "%$queryName%"),
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        return cursor.getLong(0)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return null
+    }
+
+    // ==================== MESSENGER TARZI VEKTÖREL ARAMA LOGOLARI ====================
+    private fun createMessengerVectorIcon(isVideo: Boolean, onClick: () -> Unit): ImageView {
+        val sizePx = dpToPx(36)
+        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#0084FF")
+            style = Paint.Style.FILL
+        }
+
+        val w = sizePx.toFloat()
+        if (isVideo) {
+            // Messenger Görüntülü Arama Kamera Logosu
+            val bodyRect = RectF(w * 0.16f, w * 0.28f, w * 0.64f, w * 0.72f)
+            canvas.drawRoundRect(bodyRect, w * 0.10f, w * 0.10f, paint)
+            val lensPath = Path().apply {
+                moveTo(w * 0.66f, w * 0.43f)
+                lineTo(w * 0.86f, w * 0.30f)
+                lineTo(w * 0.86f, w * 0.70f)
+                lineTo(w * 0.66f, w * 0.57f)
+                close()
+            }
+            canvas.drawPath(lensPath, paint)
+        } else {
+            // Messenger Sesli Arama Ahize Logosu
+            val phonePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#0084FF")
+                style = Paint.Style.STROKE
+                strokeWidth = w * 0.12f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            val path = Path().apply {
+                moveTo(w * 0.26f, w * 0.24f)
+                lineTo(w * 0.38f, w * 0.24f)
+                lineTo(w * 0.44f, w * 0.38f)
+                lineTo(w * 0.35f, w * 0.46f)
+                quadTo(w * 0.44f, w * 0.60f, w * 0.54f, w * 0.65f)
+                lineTo(w * 0.62f, w * 0.56f)
+                lineTo(w * 0.76f, w * 0.62f)
+                lineTo(w * 0.76f, w * 0.74f)
+                quadTo(w * 0.42f, w * 0.76f, w * 0.24f, w * 0.26f)
+            }
+            canvas.drawPath(path, phonePaint)
+        }
+
+        return ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(sizePx, sizePx).apply {
+                rightMargin = dpToPx(6)
+            }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#263951"))
+            }
+            setImageBitmap(bmp)
+            setOnClickListener { onClick() }
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun extractPhotoFromNotification(notif: Notification, extras: Bundle): Bitmap? {
         try {
-            // 1. EXTRA_PICTURE (Bitmap veya Icon)
             val picObj = extras.get(Notification.EXTRA_PICTURE)
             if (picObj is Bitmap) return picObj
             if (Build.VERSION.SDK_INT >= 23 && picObj is Icon) {
                 iconToBitmap(picObj)?.let { return it }
             }
 
-            // 2. EXTRA_PICTURE_ICON (Android 13/14/15/16 S22 Ultra standardı)
             val picIconObj = extras.get("android.pictureIcon")
             if (Build.VERSION.SDK_INT >= 23 && picIconObj is Icon) {
                 iconToBitmap(picIconObj)?.let { return it }
             }
 
-            // 3. EXTRA_LARGE_ICON_BIG
             val bigLarge = extras.get(Notification.EXTRA_LARGE_ICON_BIG)
             if (bigLarge is Bitmap) return bigLarge
             if (Build.VERSION.SDK_INT >= 23 && bigLarge is Icon) {
@@ -372,7 +630,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // WhatsApp'ın galerideki klasörüne yeni düşen fotoğrafı yakalar
     private fun fetchLatestReceivedPhoto(maxAgeSeconds: Long): Bitmap? {
         if (!hasPhotoPermission()) return null
         return try {
@@ -406,7 +663,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // Balon içinden fotoğraf göndermek için son galeri fotoğraflarını getirir
     private fun getRecentGalleryPhotos(limit: Int = 10): List<Uri> {
         val list = mutableListOf<Uri>()
         if (!hasPhotoPermission()) return list
@@ -507,7 +763,7 @@ class BubbleService : NotificationListenerService() {
         try {
             val prefs = getSharedPreferences("superbubble_history_db", Context.MODE_PRIVATE)
             val arr = JSONArray()
-            val slice = if (messages.size > 45) messages.takeLast(45) else messages
+            val slice = if (messages.size > 80) messages.takeLast(80) else messages
             for (m in slice) {
                 val obj = JSONObject()
                 obj.put("text", m.text)
@@ -560,7 +816,7 @@ class BubbleService : NotificationListenerService() {
         return output
     }
 
-    private fun nowTime(): String {
+    fun nowTime(): String {
         return SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
     }
 
@@ -569,13 +825,13 @@ class BubbleService : NotificationListenerService() {
         sbnKey: String?,
         pkgName: String,
         sender: String,
-        message: String,
+        messagesBatch: List<ChatMessage>,
         appName: String,
         avatar: Bitmap?,
-        photoBitmap: Bitmap?,
-        audioUri: String?,
         replyAction: Notification.Action?,
-        contentIntent: PendingIntent?
+        contentIntent: PendingIntent?,
+        callIntent: PendingIntent?,
+        isIncomingCall: Boolean
     ) {
         val session = activeSessions.getOrPut(chatKey) {
             val history = loadSavedMessages(chatKey)
@@ -594,36 +850,33 @@ class BubbleService : NotificationListenerService() {
         if (avatar != null) session.avatar = avatar
         if (replyAction != null) session.replyAction = replyAction
         if (contentIntent != null) session.contentIntent = contentIntent
+        session.callIntent = callIntent
+        session.isIncomingCall = isIncomingCall
 
-        val imgB64 = bitmapToBase64(photoBitmap)
-        val lastMsg = session.messages.lastOrNull()
-
-        if (lastMsg != null && !lastMsg.isMe && lastMsg.text == message) {
-            // Aynı mesajın fotoğrafı yeni yüklendiyse mevcut mesaja resmi ekle
-            if (imgB64 != null && lastMsg.imageBase64 == null) {
-                lastMsg.imageBase64 = imgB64
-                saveMessagesToDisk(chatKey, session.messages)
+        var addedNew = false
+        for (incoming in messagesBatch) {
+            val existing = session.messages.lastOrNull { it.text == incoming.text && it.isMe == incoming.isMe }
+            if (existing != null) {
+                if (incoming.imageBase64 != null && existing.imageBase64 == null) {
+                    existing.imageBase64 = incoming.imageBase64
+                    addedNew = true
+                }
+            } else {
+                session.messages.add(incoming)
+                addedNew = true
             }
-        } else {
-            session.messages.add(
-                ChatMessage(
-                    text = message,
-                    isMe = false,
-                    time = nowTime(),
-                    imageBase64 = imgB64,
-                    audioUri = audioUri
-                )
-            )
-            saveMessagesToDisk(chatKey, session.messages)
+        }
 
+        if (addedNew) {
+            saveMessagesToDisk(chatKey, session.messages)
             if (!isExpanded || activeChatKey != chatKey) {
                 session.unreadCount++
-            } else {
+            } else if (!isIncomingCall) {
                 scheduleCancelNotification(session.sbnKey, 200)
             }
         }
 
-        activeChatKey = activeChatKey ?: chatKey
+        activeChatKey = if (isIncomingCall) chatKey else (activeChatKey ?: chatKey)
 
         ensureBubbleCreated()
         refreshBubbleAppearance(session)
@@ -652,7 +905,7 @@ class BubbleService : NotificationListenerService() {
 
         bubbleView = FrameLayout(this)
 
-        val avatarContainer = FrameLayout(this).apply {
+        bubbleAvatarContainer = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(dpToPx(60), dpToPx(60), Gravity.CENTER)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -678,8 +931,8 @@ class BubbleService : NotificationListenerService() {
             scaleType = ImageView.ScaleType.CENTER_CROP
         }
 
-        avatarContainer.addView(bubbleInitialsTxt)
-        avatarContainer.addView(bubbleAvatarImg)
+        bubbleAvatarContainer?.addView(bubbleInitialsTxt)
+        bubbleAvatarContainer?.addView(bubbleAvatarImg)
 
         bubbleAppBadge = TextView(this).apply {
             layoutParams = FrameLayout.LayoutParams(dpToPx(22), dpToPx(22), Gravity.BOTTOM or Gravity.END).apply {
@@ -711,7 +964,7 @@ class BubbleService : NotificationListenerService() {
             visibility = View.GONE
         }
 
-        bubbleView?.addView(avatarContainer)
+        bubbleView?.addView(bubbleAvatarContainer)
         bubbleView?.addView(bubbleAppBadge)
         bubbleView?.addView(bubbleUnreadBadge)
 
@@ -743,7 +996,7 @@ class BubbleService : NotificationListenerService() {
                 dpToPx(48),
                 Gravity.CENTER
             )
-            text = "✕  Balonu Gizle (Geçmiş Silinmez)"
+            text = "✕  Balonu Gizle"
             textSize = 13.5f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -795,6 +1048,16 @@ class BubbleService : NotificationListenerService() {
                 MotionEvent.ACTION_UP -> {
                     dismissBarView?.visibility = View.GONE
                     if (!isDragging) {
+                        // Eğer aktif bir gelen arama varsa balona tıklayınca direkt aramanın içine at!
+                        val callingSession = activeSessions.values.firstOrNull { it.isIncomingCall && it.callIntent != null }
+                        if (callingSession != null) {
+                            try {
+                                callingSession.callIntent?.send()
+                                callingSession.isIncomingCall = false
+                                refreshBubbleAppearance(callingSession)
+                                return@setOnTouchListener true
+                            } catch (_: Exception) {}
+                        }
                         openExpandedChat()
                     } else {
                         if (event.rawY > metrics.heightPixels * 0.82f) {
@@ -842,11 +1105,18 @@ class BubbleService : NotificationListenerService() {
             bubbleInitialsTxt?.text = session.sender.take(1).uppercase()
         }
 
+        // Gelen arama varsa çerçeveyi yeşil yap ve telefon ikonu göster
+        bubbleAvatarContainer?.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor(if (session.isIncomingCall) "#00C853" else "#0084FF"))
+            setStroke(dpToPx(if (session.isIncomingCall) 3 else 2), if (session.isIncomingCall) Color.parseColor("#00E676") else Color.WHITE)
+        }
+
         val isInsta = session.appName == "Instagram"
-        bubbleAppBadge?.text = if (isInsta) "IG" else "W"
+        bubbleAppBadge?.text = if (session.isIncomingCall) "📞" else if (isInsta) "IG" else "W"
         bubbleAppBadge?.background = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
-            setColor(Color.parseColor(if (isInsta) "#E1306C" else "#25D366"))
+            setColor(Color.parseColor(if (session.isIncomingCall) "#00C853" else if (isInsta) "#E1306C" else "#25D366"))
             setStroke(dpToPx(1), Color.WHITE)
         }
 
@@ -859,7 +1129,7 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ (DİKEY & YATAY OYUN MODU UYUMLU) ====================
+    // ==================== 2. AÇIK MESSENGER SOHBET PENCERESİ ====================
     private fun openExpandedChat() {
         if (isExpanded || activeSessions.isEmpty()) return
         isExpanded = true
@@ -901,7 +1171,6 @@ class BubbleService : NotificationListenerService() {
             setOnClickListener { collapseChat() }
         }
 
-        // Yatay (Oyun/Film) modunda ekranı boydan boya kapatmasın, ortada kibar dursun!
         val cardWidth = if (isLandscape) {
             min(dpToPx(440), (metrics.widthPixels * 0.65f).toInt())
         } else {
@@ -1020,6 +1289,8 @@ class BubbleService : NotificationListenerService() {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#0084FF"))
             }
+            // Profile tıklayınca orijinal uygulamayı aç
+            setOnClickListener { openOriginalApp() }
         }
 
         headerInitialsTxt = TextView(this).apply {
@@ -1046,6 +1317,7 @@ class BubbleService : NotificationListenerService() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 leftMargin = dpToPx(10)
             }
+            setOnClickListener { openOriginalApp() }
         }
 
         headerNameTxt = TextView(this).apply {
@@ -1056,42 +1328,63 @@ class BubbleService : NotificationListenerService() {
         }
 
         headerSubTxt = TextView(this).apply {
-            textSize = 10.5f
+            textSize = 11f
             setTextColor(Color.parseColor("#00A884"))
         }
 
         titleCol.addView(headerNameTxt)
         titleCol.addView(headerSubTxt)
 
-        val clearHistoryBtn = TextView(this).apply {
-            text = "🗑️"
-            textSize = 14f
-            setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
-            setOnClickListener {
-                val active = activeSessions[activeChatKey] ?: return@setOnClickListener
-                active.messages.clear()
-                clearSavedHistory(active.key)
-                refreshExpandedUI()
-                Toast.makeText(this@BubbleService, "Sohbet geçmişi temizlendi", Toast.LENGTH_SHORT).show()
-            }
+        // Messenger Tarzı Sesli Arama ve Görüntülü Arama Vektör Logoları
+        val voiceCallIcon = createMessengerVectorIcon(isVideo = false) {
+            initiateCall(isVideo = false)
+        }
+
+        val videoCallIcon = createMessengerVectorIcon(isVideo = true) {
+            initiateCall(isVideo = true)
         }
 
         val openAppBtn = TextView(this).apply {
-            text = "Uygulama ↗"
-            textSize = 11f
+            text = "↗"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#4599FF"))
-            setPadding(dpToPx(10), dpToPx(5), dpToPx(10), dpToPx(5))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dpToPx(34), dpToPx(34))
             background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#263951"))
-                cornerRadius = dpToPx(12).toFloat()
             }
             setOnClickListener { openOriginalApp() }
         }
 
         cardHeader.addView(headerAvatarBox)
         cardHeader.addView(titleCol)
-        cardHeader.addView(clearHistoryBtn)
+        cardHeader.addView(voiceCallIcon)
+        cardHeader.addView(videoCallIcon)
         cardHeader.addView(openAppBtn)
+
+        // Gelen Arama Olduğunda Çıkan Yeşil Katılma Çubuğu
+        incomingCallBanner = TextView(this).apply {
+            text = "📞 GELEN ARAMA VAR • Katılmak İçin Dokun"
+            textSize = 13f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(10), dpToPx(8), dpToPx(10), dpToPx(8))
+            setBackgroundColor(Color.parseColor("#00C853"))
+            visibility = View.GONE
+            setOnClickListener {
+                val active = activeSessions[activeChatKey]
+                try {
+                    active?.callIntent?.send() ?: active?.contentIntent?.send()
+                    active?.isIncomingCall = false
+                    collapseChat()
+                } catch (_: Exception) {
+                    openOriginalApp()
+                }
+            }
+        }
 
         // Mesaj Listesi
         messagesScroll = ScrollView(this).apply {
@@ -1112,7 +1405,6 @@ class BubbleService : NotificationListenerService() {
         }
         messagesScroll?.addView(messagesContainer)
 
-        // Açılır Emoji / Fotoğraf / Ses Araç Paneli
         extraToolPanel = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -1122,7 +1414,7 @@ class BubbleService : NotificationListenerService() {
             visibility = View.GONE
         }
 
-        // --- ALT ÇUBUK: 😀 EMOJİ + 📷 FOTOĞRAF + MESAJ YAZ + 🎤 SES + ➤ GÖNDER ---
+        // --- ALT ÇUBUK ---
         val inputBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1137,13 +1429,8 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        val emojiBtn = createActionIconButton("😀") {
-            toggleEmojiPanel()
-        }
-
-        val photoBtn = createActionIconButton("📷") {
-            togglePhotoPickerPanel()
-        }
+        val emojiBtn = createActionIconButton("😀") { toggleEmojiPanel() }
+        val photoBtn = createActionIconButton("📷") { togglePhotoPickerPanel() }
 
         replyEdit = EditText(this).apply {
             val h = if (isLandscape) dpToPx(38) else dpToPx(42)
@@ -1170,9 +1457,7 @@ class BubbleService : NotificationListenerService() {
             }
         }
 
-        val voiceBtn = createActionIconButton("🎤") {
-            toggleVoicePanel()
-        }
+        val voiceBtn = createActionIconButton("🎤") { toggleVoicePanel() }
 
         val sendCircleBtn = TextView(this).apply {
             text = "➤"
@@ -1197,6 +1482,7 @@ class BubbleService : NotificationListenerService() {
         inputBar.addView(sendCircleBtn)
 
         chatCard.addView(cardHeader)
+        chatCard.addView(incomingCallBanner)
         chatCard.addView(messagesScroll)
         chatCard.addView(extraToolPanel)
         chatCard.addView(inputBar)
@@ -1237,7 +1523,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 😀 EMOJİ PANELİ ====================
     private fun toggleEmojiPanel() {
         val panel = extraToolPanel ?: return
         if (panel.visibility == View.VISIBLE && panel.tag == "EMOJI") {
@@ -1256,18 +1541,14 @@ class BubbleService : NotificationListenerService() {
         val scroll = HorizontalScrollView(this).apply {
             setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
         }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
 
         emojis.forEach { emo ->
             val tv = TextView(this).apply {
                 text = emo
                 textSize = 22f
                 setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
-                setOnClickListener {
-                    replyEdit?.append(emo)
-                }
+                setOnClickListener { replyEdit?.append(emo) }
             }
             row.addView(tv)
         }
@@ -1277,7 +1558,6 @@ class BubbleService : NotificationListenerService() {
         panel.visibility = View.VISIBLE
     }
 
-    // ==================== 📷 FOTOĞRAF GÖNDERME PANELİ ====================
     private fun togglePhotoPickerPanel() {
         val panel = extraToolPanel ?: return
         if (panel.visibility == View.VISIBLE && panel.tag == "PHOTO") {
@@ -1295,10 +1575,9 @@ class BubbleService : NotificationListenerService() {
         val recentUris = getRecentGalleryPhotos(10)
         if (recentUris.isEmpty()) {
             val info = TextView(this).apply {
-                text = "Galeriden hızlı fotoğraf seçmek için SuperBubble ana ekranından 3. İzin (Fotoğraf İzni) butonuna bas kanka."
+                text = "Galeriden fotoğraf seçmek için SuperBubble ana ekranından 3. İzin butonuna bas kanka."
                 textSize = 12f
                 setTextColor(Color.LTGRAY)
-                setPadding(0, 0, 0, dpToPx(6))
             }
             container.addView(info)
         } else {
@@ -1322,9 +1601,7 @@ class BubbleService : NotificationListenerService() {
                         }
                         scaleType = ImageView.ScaleType.CENTER_CROP
                         setImageBitmap(bmp)
-                        setOnClickListener {
-                            sharePhotoToActiveApp(uri)
-                        }
+                        setOnClickListener { sharePhotoToActiveApp(uri) }
                     }
                     row.addView(img)
                 }
@@ -1353,7 +1630,6 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    // ==================== 🎤 SES KAYDI & SESLE YAZMA PANELİ ====================
     private fun toggleVoicePanel() {
         val panel = extraToolPanel ?: return
         if (panel.visibility == View.VISIBLE && panel.tag == "VOICE") {
@@ -1383,9 +1659,7 @@ class BubbleService : NotificationListenerService() {
                 setColor(Color.parseColor("#0084FF"))
                 cornerRadius = dpToPx(14).toFloat()
             }
-            setOnClickListener {
-                startVoiceDictation()
-            }
+            setOnClickListener { startVoiceDictation() }
         }
 
         val directVoiceNoteBtn = TextView(this).apply {
@@ -1400,9 +1674,7 @@ class BubbleService : NotificationListenerService() {
                 setColor(Color.parseColor("#00A884"))
                 cornerRadius = dpToPx(14).toFloat()
             }
-            setOnClickListener {
-                openOriginalApp()
-            }
+            setOnClickListener { openOriginalApp() }
         }
 
         row.addView(voiceToTextBtn)
@@ -1417,16 +1689,9 @@ class BubbleService : NotificationListenerService() {
         imm.showSoftInput(replyEdit, InputMethodManager.SHOW_IMPLICIT)
         Toast.makeText(
             this,
-            "Klavyenin üstündeki mikrofon 🎙️ simgesine basıp konuş kanka, direkt buradan gönderir!",
-            Toast.LENGTH_LONG
+            "Klavyenin üstündeki mikrofon 🎙️ simgesine basıp konuş kanka!",
+            Toast.LENGTH_SHORT
         ).show()
-    }
-
-    private fun destroySpeech() {
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        speechRecognizer = null
     }
 
     private fun showFullScreenPhoto(bmp: Bitmap) {
@@ -1466,6 +1731,11 @@ class BubbleService : NotificationListenerService() {
     private fun openOriginalApp() {
         val active = activeSessions[activeChatKey]
         try {
+            if (active?.isIncomingCall == true && active.callIntent != null) {
+                active.callIntent?.send()
+                collapseChat()
+                return
+            }
             if (active?.contentIntent != null) {
                 active.contentIntent?.send()
                 collapseChat()
@@ -1528,7 +1798,9 @@ class BubbleService : NotificationListenerService() {
         activeChatKey = active.key
         active.unreadCount = 0
 
-        scheduleCancelNotification(active.sbnKey, 150)
+        if (!active.isIncomingCall) {
+            scheduleCancelNotification(active.sbnKey, 150)
+        }
 
         val isLandscape = resources.displayMetrics.widthPixels > resources.displayMetrics.heightPixels
         val headDim = if (isLandscape) dpToPx(42) else dpToPx(52)
@@ -1542,7 +1814,7 @@ class BubbleService : NotificationListenerService() {
                 }
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor("#0084FF"))
+                    setColor(Color.parseColor(if (sess.isIncomingCall) "#00C853" else "#0084FF"))
                     setStroke(dpToPx(if (isSelected) 3 else 1), if (isSelected) Color.WHITE else Color.GRAY)
                 }
                 setOnClickListener {
@@ -1591,10 +1863,13 @@ class BubbleService : NotificationListenerService() {
         }
 
         headerNameTxt?.text = active.sender
-        headerSubTxt?.text = "${active.appName} • Geçmiş Kayıtlı"
+        // "Geçmiş Kayıtlı" yazısı kaldırıldı, sadece uygulama adı veya arama durumu yazar
+        headerSubTxt?.text = if (active.isIncomingCall) "📞 Gelen Arama..." else active.appName
         headerSubTxt?.setTextColor(
             Color.parseColor(if (active.appName == "Instagram") "#E1306C" else "#25D366")
         )
+
+        incomingCallBanner?.visibility = if (active.isIncomingCall) View.VISIBLE else View.GONE
 
         messagesContainer?.removeAllViews()
         active.messages.forEach { msg ->
@@ -1628,7 +1903,6 @@ class BubbleService : NotificationListenerService() {
                 }
                 bubbleBox.addView(photoView)
             } else if (!msg.isMe && isPhotoMessageText(msg.text)) {
-                // Eğer fotoğraf gizliyse veya henüz galeriye inmediyse tıklanabilir buton göster
                 val openPhotoBtn = TextView(this).apply {
                     text = "📷 Fotoğrafı Gör ↗"
                     textSize = 12.5f
@@ -1747,7 +2021,7 @@ class BubbleService : NotificationListenerService() {
         } catch (_: PendingIntent.CanceledException) {
             Toast.makeText(
                 this,
-                "Bildirim süresi dolmuş, sağ üstten 'Uygulama ↗' tuşuna basabilirsin kanka.",
+                "Bildirim süresi dolmuş, sağ üstten '↗' tuşuna basabilirsin kanka.",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -1803,4 +2077,80 @@ class BubbleService : NotificationListenerService() {
             resources.displayMetrics
         ).toInt()
     }
+}
+
+// ==================== UYGULAMA İÇİ SOHBET GEÇMİŞİNİ EŞİTLEYEN ERİŞİLEBİLİRLİK SERVİSİ ====================
+class ChatSyncService : AccessibilityService() {
+
+    private var lastSyncTime = 0L
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event ?: return
+        val pkg = event.packageName?.toString() ?: return
+        if (!BubbleService.TARGET_PACKAGES.contains(pkg)) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastSyncTime < 900) return
+        lastSyncTime = now
+
+        val root = rootInActiveWindow ?: return
+        try {
+            val screenWidth = resources.displayMetrics.widthPixels
+
+            // 1. WhatsApp / Instagram üst başlığındaki kişi adını bul
+            val titleNode = findHeaderTitle(root, pkg) ?: return
+            val chatTitle = titleNode.trim()
+            if (chatTitle.isEmpty()) return
+
+            // 2. Ekrandaki görünür mesaj balonlarını (Konumu sağdaysa bizim, soldaysa karşı tarafın) topla
+            val messages = mutableListOf<Pair<String, Boolean>>()
+            collectMessagesFromNode(root, pkg, screenWidth, messages)
+
+            if (messages.isNotEmpty()) {
+                BubbleService.instance?.syncFromAppScreen(pkg, chatTitle, messages)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun findHeaderTitle(root: AccessibilityNodeInfo, pkg: String): String? {
+        val idCandidates = if (pkg.contains("whatsapp")) {
+            listOf("com.whatsapp:id/conversation_contact_name", "com.whatsapp.w4b:id/conversation_contact_name")
+        } else {
+            listOf("com.instagram.android:id/thread_title", "com.instagram.android:id/action_bar_title")
+        }
+
+        for (id in idCandidates) {
+            val list = root.findAccessibilityNodeInfosByViewId(id)
+            if (!list.isNullOrEmpty()) {
+                val txt = list[0].text?.toString()?.trim()
+                if (!txt.isNullOrEmpty()) return txt
+            }
+        }
+        return null
+    }
+
+    private fun collectMessagesFromNode(
+        root: AccessibilityNodeInfo,
+        pkg: String,
+        screenWidth: Int,
+        outList: MutableList<Pair<String, Boolean>>
+    ) {
+        if (pkg.contains("whatsapp")) {
+            val idList = listOf("com.whatsapp:id/message_text", "com.whatsapp.w4b:id/message_text")
+            for (id in idList) {
+                val nodes = root.findAccessibilityNodeInfosByViewId(id) ?: continue
+                for (node in nodes) {
+                    val txt = node.text?.toString()?.trim() ?: continue
+                    if (txt.isEmpty()) continue
+                    val rect = Rect()
+                    node.getBoundsInScreen(rect)
+                    // Mesaj kutusu ekranın sağ yarısına yakınsa gönderen biziz (isMe = true)
+                    val isMe = rect.centerX() > (screenWidth * 0.50f) || rect.left > (screenWidth * 0.22f)
+                    outList.add(Pair(txt, isMe))
+                }
+            }
+        }
+    }
+
+    override fun onInterrupt() {}
 }
