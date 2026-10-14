@@ -1,9 +1,12 @@
 package com.selim.superbubble
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
@@ -12,6 +15,8 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
@@ -28,29 +33,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "SuperBubble Kontrol Paneli"
-            textSize = 22f
+            text = "SuperBubble Pro Kontrol Paneli"
+            textSize = 21f
             setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 40)
+            setPadding(0, 0, 0, 30)
         }
 
         statusText = TextView(this).apply {
-            textSize = 15f
+            textSize = 14.5f
             setTextColor(Color.LTGRAY)
-            setPadding(0, 0, 0, 60)
+            setPadding(0, 0, 0, 40)
         }
 
         val btnOverlay = Button(this).apply {
             text = "1. Ekran Üstü Balon İznini Ver"
             setOnClickListener {
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
-                    val intent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
                     )
-                    startActivity(intent)
                 } else {
-                    Toast.makeText(this@MainActivity, "Bu izin zaten tamam kanka!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Ekran üstü izni zaten aktif kanka!", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -59,6 +65,13 @@ class MainActivity : AppCompatActivity() {
             text = "2. Bildirim Yakalama İznini Ver"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            }
+        }
+
+        val btnMedia = Button(this).apply {
+            text = "3. Fotoğraf Görme ve Gönderme İzni"
+            setOnClickListener {
+                requestPhotoPermission()
             }
         }
 
@@ -77,18 +90,43 @@ class MainActivity : AppCompatActivity() {
         layout.addView(statusText)
         layout.addView(btnOverlay)
         layout.addView(btnNotification)
+        layout.addView(btnMedia)
         layout.addView(btnTest)
 
         setContentView(layout)
+    }
+
+    private fun hasPhotoPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun requestPhotoPermission() {
+        if (hasPhotoPermission()) {
+            Toast.makeText(this, "Fotoğraf izni zaten aktif kanka!", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        ActivityCompat.requestPermissions(this, arrayOf(perm), 101)
     }
 
     override fun onResume() {
         super.onResume()
         val hasOverlay = Settings.canDrawOverlays(this)
         val hasNotif = isNotificationServiceEnabled()
-        statusText.text = "Ekran Üstü İzni: ${if (hasOverlay) "AKTİF ✅" else "EKSİK ❌"}\n" +
-                "Bildirim İzni: ${if (hasNotif) "AKTİF ✅" else "EKSİK ❌"}\n\n" +
-                "Her iki izin aktif olduğunda WhatsApp ve Instagram mesajların otomatik olarak balona dönüşür."
+        val hasPhoto = hasPhotoPermission()
+        statusText.text =
+            "1. Ekran Üstü İzni: ${if (hasOverlay) "AKTİF ✅" else "EKSİK ❌"}\n" +
+            "2. Bildirim İzni: ${if (hasNotif) "AKTİF ✅" else "EKSİK ❌"}\n" +
+            "3. Fotoğraf/Galeri İzni: ${if (hasPhoto) "AKTİF ✅" else "EKSİK ❌"}\n\n" +
+            "Üç izin de aktif olduğunda fotoğraflar, emojiler ve yatay oyun modu tam kapasite çalışır."
     }
 
     private fun isNotificationServiceEnabled(): Boolean {
