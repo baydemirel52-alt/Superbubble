@@ -19,11 +19,22 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Orijinal Android Debug Keystore Onbellegi
+      - name: Sabit Keystore Onbellegi
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: superbubble-android-debug-keystore-v2
+          path: signing/superbubble.keystore
+          key: superbubble-keystore-v1
+
+      - name: Keystore Hazirla
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p signing
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > signing/superbubble.keystore
+          elif [ ! -f signing/superbubble.keystore ]; then
+            keytool -genkeypair -v -keystore signing/superbubble.keystore -alias superbubble -keyalg RSA -keysize 2048 -validity 10000 -storepass superbubble123 -keypass superbubble123 -dname "CN=Selim Demirel, OU=SuperBubble, O=Selim, L=Ordu, S=Ordu, C=TR"
+          fi
 
       - name: Gradle Kur
         uses: gradle/actions/setup-gradle@v3
@@ -73,7 +84,7 @@ jobs:
                     android:allowBackup="false"
                     android:icon="@mipmap/ic_launcher"
                     android:roundIcon="@mipmap/ic_launcher"
-                    android:label="SuperBubble Pro"
+                    android:label="SuperBubble"
                     android:supportsRtl="true"
                     android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
@@ -110,7 +121,7 @@ jobs:
                     </service>
                 </application>
             </manifest>"""
-            open("app/src/main/AndroidManifest.xml", "w").write("\n".join(line.strip() for line in manifest.strip().splitlines()))
+            open("app/src/main/AndroidManifest.xml", "w").write(manifest.strip())
 
             acc_xml = """<?xml version="1.0" encoding="utf-8"?>
             <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -120,7 +131,7 @@ jobs:
                 android:canRetrieveWindowContent="true"
                 android:notificationTimeout="350"
                 android:packageNames="com.whatsapp,com.whatsapp.w4b,com.instagram.android,org.telegram.messenger,org.telegram.messenger.web" />"""
-            open("app/src/main/res/xml/accessibility_service_config.xml", "w").write("\n".join(line.strip() for line in acc_xml.strip().splitlines()))
+            open("app/src/main/res/xml/accessibility_service_config.xml", "w").write(acc_xml.strip())
 
             bg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
                 android:width="108dp"
@@ -130,7 +141,7 @@ jobs:
                 <path android:fillColor="#0F172A" android:pathData="M0,0h108v108h-108z"/>
                 <path android:fillColor="#1E293B" android:pathData="M0,0L108,108L0,108z"/>
             </vector>"""
-            open("app/src/main/res/drawable/ic_launcher_bg.xml", "w").write("\n".join(line.strip() for line in bg.strip().splitlines()))
+            open("app/src/main/res/drawable/ic_launcher_bg.xml", "w").write(bg.strip())
 
             fg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
                 android:width="108dp"
@@ -141,18 +152,18 @@ jobs:
                 <path android:fillColor="#0084FF" android:pathData="M64,40 C50,40 40,49 40,61 C40,73 50,82 64,82 C67,82 70,81 73,80 L84,85 L81,75 C86,71 88,66 88,61 C88,49 78,40 64,40 Z"/>
                 <path android:fillColor="#FFFFFF" android:pathData="M52,56h24v4h-24zM52,64h16v4h-16z"/>
             </vector>"""
-            open("app/src/main/res/drawable/ic_launcher_fg.xml", "w").write("\n".join(line.strip() for line in fg.strip().splitlines()))
+            open("app/src/main/res/drawable/ic_launcher_fg.xml", "w").write(fg.strip())
 
             adaptive = """<?xml version="1.0" encoding="utf-8"?>
             <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
                 <background android:drawable="@drawable/ic_launcher_bg"/>
                 <foreground android:drawable="@drawable/ic_launcher_fg"/>
             </adaptive-icon>"""
-            open("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w").write("\n".join(line.strip() for line in adaptive.strip().splitlines()))
+            open("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w").write(adaptive.strip())
 
             gradle_props = """android.useAndroidX=true
             org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8"""
-            open("gradle.properties", "w").write("\n".join(line.strip() for line in gradle_props.strip().splitlines()))
+            open("gradle.properties", "w").write("\n".join(line.strip() for line in gradle_props.splitlines()))
 
             settings_gradle = """pluginManagement {
                 repositories {
@@ -171,13 +182,13 @@ jobs:
             rootProject.name = "SuperBubble"
             include ":app"
             """
-            open("settings.gradle", "w").write("\n".join(line.strip() for line in settings_gradle.strip().splitlines()))
+            open("settings.gradle", "w").write(settings_gradle.strip())
 
             root_gradle = """plugins {
                 id "com.android.application" version "8.2.0" apply false
                 id "org.jetbrains.kotlin.android" version "1.9.20" apply false
             }"""
-            open("build.gradle", "w").write("\n".join(line.strip() for line in root_gradle.strip().splitlines()))
+            open("build.gradle", "w").write(root_gradle.strip())
 
             app_gradle = """plugins {
                 id "com.android.application"
@@ -190,11 +201,26 @@ jobs:
                 compileSdk 34
 
                 defaultConfig {
-                    applicationId "com.selim.superbubble.pro"
+                    applicationId "com.selim.superbubble"
                     minSdk 26
                     targetSdk 34
                     versionCode 5
                     versionName "5.0"
+                }
+
+                signingConfigs {
+                    debug {
+                        storeFile file("${rootProject.projectDir}/signing/superbubble.keystore")
+                        storePassword System.getenv("KEYSTORE_PASSWORD") ?: "superbubble123"
+                        keyAlias System.getenv("KEY_ALIAS") ?: "superbubble"
+                        keyPassword System.getenv("KEY_PASSWORD") ?: "superbubble123"
+                    }
+                }
+
+                buildTypes {
+                    debug {
+                        signingConfig signingConfigs.debug
+                    }
                 }
 
                 testOptions {
@@ -220,7 +246,7 @@ jobs:
                 kapt "androidx.room:room-compiler:2.6.1"
                 testImplementation "junit:junit:4.13.2"
             }"""
-            open("app/build.gradle", "w").write("\n".join(line.strip() for line in app_gradle.strip().splitlines()))
+            open("app/build.gradle", "w").write(app_gradle.strip())
           '
 
       - name: Testleri Calistir ve APK Derle
