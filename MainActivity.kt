@@ -178,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                 textSize = 11.5f
                 setOnClickListener {
                     SettingsManager.setBubbleSizeDp(this@MainActivity, dpVal)
-                    Toast.makeText(this@MainActivity, "Balon boyutu: $label olarak ayarlandı!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Balon boyutu: $label (bir sonraki balonda geçerli olur)", Toast.LENGTH_SHORT).show()
                 }
             }
             sizeRow.addView(b)
@@ -194,7 +194,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnSaveFilter = Button(this).apply {
-            text = "Kişi Filtresini Kaydet & Sessize Alınanları Sıfırla"
+            text = "Kişi Filtresini Kaydet"
             setOnClickListener {
                 val csv = filterInput.text.toString().trim()
                 SettingsManager.setAllowedSendersCsv(this@MainActivity, csv)

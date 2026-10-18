@@ -26,6 +26,7 @@ import android.provider.ContactsContract
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -199,6 +200,8 @@ class BubbleService : NotificationListenerService() {
         if (!SettingsManager.ALL_SUPPORTED_PACKAGES.contains(pkg)) return
 
         repository.ioExecutor.execute {
+            // Arka plan thread'inde yakalanmayan tek bir hata bile uygulamayı çökertir, o yüzden her şey try/catch içinde.
+            try {
             val parsed = NotificationParser.parse(this, sbn, repository) ?: return@execute
             when (parsed) {
                 is ParsedNotification.RemoteReplyConfirmation -> {
@@ -300,6 +303,9 @@ class BubbleService : NotificationListenerService() {
                     }
                 }
             }
+            } catch (e: Exception) {
+                Log.e("SuperBubble", "Bildirim islenirken hata", e)
+            }
         }
     }
 
@@ -371,6 +377,7 @@ class BubbleService : NotificationListenerService() {
         isIncomingCall: Boolean
     ) {
         val newlyAdded = mutableListOf<ChatMessage>()
+        val claimedOwnIds = HashSet<String>()
         for (incoming in messagesBatch) {
             val idx = session.messages.indexOfFirst { it.id == incoming.id }
             if (idx >= 0) {
@@ -381,8 +388,23 @@ class BubbleService : NotificationListenerService() {
                     newlyAdded.add(updated)
                 }
             } else {
-                session.messages.add(incoming)
-                newlyAdded.add(incoming)
+                // Balondan yazdığımız mesaj anında ekrana eklenir (zamanı bizim saatimiz). WhatsApp o mesajı sonradan
+                // bildirimde kendi zamanıyla listeleyince id tutmaz ve mesaj iki kere görünürdü. Aynı metin + 30 sn
+                // içindeyse bunu aynı mesaj sayıyoruz.
+                val ownTwinIdx = if (incoming.isMe) {
+                    session.messages.indexOfFirst {
+                        it.isMe && it.id !in claimedOwnIds &&
+                            NotificationParser.isSameOwnMessage(it.text, it.timestamp, incoming.text, incoming.timestamp)
+                    }
+                } else {
+                    -1
+                }
+                if (ownTwinIdx >= 0) {
+                    claimedOwnIds.add(session.messages[ownTwinIdx].id)
+                } else {
+                    session.messages.add(incoming)
+                    newlyAdded.add(incoming)
+                }
             }
         }
 
@@ -423,26 +445,29 @@ class BubbleService : NotificationListenerService() {
                 it.pkgName == pkgName && it.sender.equals(cleanTitle, ignoreCase = true)
             } ?: return@post
 
+            // Ekrandaki TÜM görünen mesajları eklemek yerine, sadece bubble'ın bildiği son mesajlardan SONRA gelenleri ekle.
+            // (Eskiden ekrandaki eski mesajlar sona, "şimdi" saatiyle eklenip sırayı bozuyordu.)
+            val known = session.messages.map { Pair(it.text, it.isMe) }
+            val fresh = NotificationParser.findNewScreenMessages(known, screenMessages)
+            if (fresh.isEmpty()) return@post
+
             val newlySynced = mutableListOf<ChatMessage>()
-            val baseTime = System.currentTimeMillis()
-            for (i in screenMessages.indices) {
-                val (msgText, isMe) = screenMessages[i]
-                val alreadyInTail = session.messages.takeLast(35).any { it.text == msgText && it.isMe == isMe }
-                if (!alreadyInTail) {
-                    val ts = baseTime + i
-                    val msg = ChatMessage(
-                        id = NotificationParser.buildMessageId(ts, cleanTitle, isMe, msgText),
-                        chatKey = session.key,
-                        senderName = null,
-                        text = msgText,
-                        isMe = isMe,
-                        time = NotificationParser.formatTime(ts),
-                        timestamp = ts,
-                        isDelivered = isMe
-                    )
-                    session.messages.add(msg)
-                    newlySynced.add(msg)
-                }
+            val baseTime = max(System.currentTimeMillis(), (session.messages.lastOrNull()?.timestamp ?: 0L) + 1L)
+            for (i in fresh.indices) {
+                val (msgText, isMe) = fresh[i]
+                val ts = baseTime + i
+                val msg = ChatMessage(
+                    id = NotificationParser.buildMessageId(ts, cleanTitle, isMe, msgText),
+                    chatKey = session.key,
+                    senderName = null,
+                    text = msgText,
+                    isMe = isMe,
+                    time = NotificationParser.formatTime(ts),
+                    timestamp = ts,
+                    isDelivered = isMe
+                )
+                session.messages.add(msg)
+                newlySynced.add(msg)
             }
 
             if (newlySynced.isNotEmpty()) {

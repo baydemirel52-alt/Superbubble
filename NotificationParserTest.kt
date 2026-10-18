@@ -71,4 +71,47 @@ class NotificationParserTest {
         assertTrue(NotificationParser.isSelfSender("Selim", "Selim"))
         assertFalse(NotificationParser.isSelfSender("Mehmet", "Selim"))
     }
+
+    @Test
+    fun `ekranda sadece balonun bilmedigi yeni mesajlar bulunur`() {
+        val known = listOf("selam" to false, "nasilsin" to false, "iyiyim" to true)
+        val screen = listOf(
+            "cok eski mesaj" to false,
+            "selam" to false,
+            "nasilsin" to false,
+            "iyiyim" to true,
+            "super" to false,
+            "haha" to true
+        )
+        assertEquals(
+            listOf("super" to false, "haha" to true),
+            NotificationParser.findNewScreenMessages(known, screen)
+        )
+    }
+
+    @Test
+    fun `ekran ayniysa veya hic eslesme yoksa hicbir sey eklenmez`() {
+        val known = listOf("selam" to false, "tamam" to true)
+        val none = emptyList<Pair<String, Boolean>>()
+        assertEquals(none, NotificationParser.findNewScreenMessages(known, known))
+        assertEquals(none, NotificationParser.findNewScreenMessages(known, listOf("baska" to false)))
+        assertEquals(none, NotificationParser.findNewScreenMessages(emptyList(), known))
+    }
+
+    @Test
+    fun `ayni metinli yeni mesaj kaybolmaz`() {
+        val known = listOf("selam" to false, "tamam" to false)
+        val screen = listOf("selam" to false, "tamam" to false, "tamam" to false)
+        assertEquals(
+            listOf("tamam" to false),
+            NotificationParser.findNewScreenMessages(known, screen)
+        )
+    }
+
+    @Test
+    fun `balondan yazilan mesaj bildirimde sonradan gelirse ayni mesaj sayilir`() {
+        assertTrue(NotificationParser.isSameOwnMessage("ok", 1_000L, "ok", 9_000L))
+        assertFalse(NotificationParser.isSameOwnMessage("ok", 1_000L, "ok", 40_000L))
+        assertFalse(NotificationParser.isSameOwnMessage("ok", 1_000L, "tamam", 2_000L))
+    }
 }

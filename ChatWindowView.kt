@@ -143,12 +143,10 @@ class MessageAdapter(
 
         holder.msgTxt.text = msg.text
 
-        // Zaman ve İletildi (✓ / ✓✓) bilgisi
-        holder.timeTxt.text = if (msg.isMe) {
-            if (msg.isDelivered) "${msg.time} ✓✓" else "${msg.time} ✓"
-        } else {
-            msg.time
-        }
+        // ✓ = mesaj uygulamaya (WhatsApp / Instagram / Telegram) teslim edildi.
+        // Karşı tarafa ulaştı / okundu bilgisi bildirimden ALINAMAZ; o yüzden çift tik (✓✓) göstermiyoruz,
+        // yoksa "iletildi" gibi yanlış bir izlenim verir.
+        holder.timeTxt.text = if (msg.isMe) "${msg.time} ✓" else msg.time
 
         // Fotoğraf varsa arka planda yükle
         holder.photoView.visibility = View.GONE

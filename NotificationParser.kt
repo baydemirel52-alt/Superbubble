@@ -91,6 +91,50 @@ object NotificationParser {
         return isOngoing || hasFullScreenIntent
     }
 
+    fun stableNotificationTime(notifWhen: Long, postTime: Long): Long {
+        return if (notifWhen > 0L) notifWhen else postTime
+    }
+
+    /**
+     * Bubble'dan gönderdiğimiz mesajı (anında ekrana eklenen, zamanı bizim saatimiz) ile
+     * WhatsApp'ın sonradan bildirimde listelediği AYNI mesajı eşleştirir.
+     * Zamanlar birebir tutmaz, o yüzden "aynı metin + 30 sn içinde" kuralı kullanılır.
+     */
+    fun isSameOwnMessage(textA: String, timeA: Long, textB: String, timeB: Long): Boolean {
+        return textA == textB && kotlin.math.abs(timeA - timeB) <= 30_000L
+    }
+
+    /**
+     * Uygulama ekranında görünen mesajlardan, bubble'ın henüz bilmediği YENİ olanları bulur.
+     * known: bubble'daki mesajlar (eskiden yeniye), screen: ekrandaki mesajlar (yukarıdan aşağıya).
+     * Mantık: bubble'ın son N mesajının sonundan başlayan en uzun diziyi ekranda ararız,
+     * eşleşmenin SONRASINDAKİLER yenidir. Eşleşme yoksa hiçbir şey eklenmez (yanlış sıraya eklemektense eklememek).
+     */
+    fun findNewScreenMessages(
+        known: List<Pair<String, Boolean>>,
+        screen: List<Pair<String, Boolean>>
+    ): List<Pair<String, Boolean>> {
+        if (known.isEmpty() || screen.isEmpty()) return emptyList()
+        val tail = known.takeLast(40)
+        val maxLen = minOf(tail.size, screen.size)
+        for (len in maxLen downTo 1) {
+            val suffix = tail.subList(tail.size - len, tail.size)
+            var start = screen.size - len
+            while (start >= 0) {
+                var same = true
+                for (k in 0 until len) {
+                    if (screen[start + k] != suffix[k]) {
+                        same = false
+                        break
+                    }
+                }
+                if (same) return screen.subList(start + len, screen.size)
+                start--
+            }
+        }
+        return emptyList()
+    }
+
     fun isSelfSender(sender: String?, selfDisplayName: String?): Boolean {
         if (sender.isNullOrBlank()) return false
         val s = sender.trim()
@@ -175,10 +219,12 @@ object NotificationParser {
 
         // 3. Sistem/Özet Bildirimlerini ve Kendi Mesajlarımızı Filtrele
         val selfName = extras.getCharSequence(Notification.EXTRA_SELF_DISPLAY_NAME)?.toString()?.trim()
+        // Not: Eskiden metinde "WhatsApp Web" geçen HER mesaj atılıyordu (biri "whatsapp web açılmıyor" yazsa kaybolurdu).
+        // Artık sadece sistemin kendi bildirimleri (başlığı/metni baştan eşleşenler) elenir.
         if (text.isEmpty() ||
-            text.contains("Yeni mesajlar kontrol ediliyor", ignoreCase = true) ||
-            text.contains("Checking for new messages", ignoreCase = true) ||
-            text.contains("WhatsApp Web", ignoreCase = true) ||
+            text.startsWith("Yeni mesajlar kontrol ediliyor", ignoreCase = true) ||
+            text.startsWith("Checking for new messages", ignoreCase = true) ||
+            cleanTitle.equals("WhatsApp Web", ignoreCase = true) ||
             cleanTitle.equals("WhatsApp", ignoreCase = true) ||
             cleanTitle.equals("Instagram", ignoreCase = true) ||
             cleanTitle.equals("Telegram", ignoreCase = true) ||
@@ -212,7 +258,7 @@ object NotificationParser {
                 val b = allBundles[i] as? Bundle ?: continue
                 val bSender = b.getCharSequence("sender")?.toString()?.trim()
                 val bText = b.getCharSequence("text")?.toString()?.trim() ?: continue
-                val bTime = b.getLong("time", 0L).takeIf { it > 0L } ?: (sbn.postTime + i)
+                val bTime = b.getLong("time", 0L).takeIf { it > 0L } ?: (stableNotificationTime(notif.`when`, sbn.postTime) + i)
                 val isFromMe = isSelfSender(bSender, selfName)
 
                 var itemImagePath: String? = null
@@ -272,7 +318,9 @@ object NotificationParser {
                 }
             }
 
-            val msgTime = sbn.postTime
+            // postTime bildirim her güncellendiğinde değişir -> aynı mesaj tekrar tekrar eklenirdi.
+            // Notification.when çoğu uygulamada mesajın kendi zamanıdır ve güncellemede sabit kalır.
+            val msgTime = stableNotificationTime(notif.`when`, sbn.postTime)
             val msgId = buildMessageId(msgTime, groupSender ?: cleanTitle, false, actualText)
             extractedBatch.add(
                 ChatMessage(
