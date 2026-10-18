@@ -19,101 +19,77 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Sabit Keystore Onbellegi (Silmeden Ustune Kurulum Icin)
+        uses: actions/cache@v4
+        with:
+          path: signing/superbubble.keystore
+          key: superbubble- persistent-keystore-v1
+
+      - name: Keystore Hazirla
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p signing
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > signing/superbubble.keystore
+          elif [ ! -f signing/superbubble.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore signing/superbubble.keystore \
+              -alias superbubble \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass superbubble123 \
+              -keypass superbubble123 \
+              -dname "CN=Selim Demirel, OU=SuperBubble, O=Selim, L=Ordu, S=Ordu, C=TR"
+          fi
+
       - name: Gradle Kur
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.4'
 
-      - name: Proje Klasorlerini ve Logoyu Otomatik Hazirla
+      - name: Proje Klasorlerini ve Dosyalari Hazirla
         run: |
           mkdir -p app/src/main/java/com/selim/superbubble
+          mkdir -p app/src/test/java/com/selim/superbubble
           mkdir -p app/src/main/res/drawable
           mkdir -p app/src/main/res/mipmap-anydpi-v26
           mkdir -p app/src/main/res/xml
 
+          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
           cp MainActivity.kt app/src/main/java/com/selim/superbubble/MainActivity.kt
           cp BubbleService.kt app/src/main/java/com/selim/superbubble/BubbleService.kt
+          cp ChatSyncService.kt app/src/main/java/com/selim/superbubble/ChatSyncService.kt
+          cp NotificationParser.kt app/src/main/java/com/selim/superbubble/NotificationParser.kt
+          cp ChatStorage.kt app/src/main/java/com/selim/superbubble/ChatStorage.kt
+          cp ChatWindowView.kt app/src/main/java/com/selim/superbubble/ChatWindowView.kt
+          cp NotificationParserTest.kt app/src/test/java/com/selim/superbubble/NotificationParserTest.kt
 
-          python3 -c '
-          manifest = """<?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-              <uses-permission android:name="android.permission.READ_CONTACTS" />
-              <uses-permission android:name="android.permission.CALL_PHONE" />
-              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-
-              <application
-                  android:allowBackup="true"
-                  android:icon="@mipmap/ic_launcher"
-                  android:roundIcon="@mipmap/ic_launcher"
-                  android:label="SuperBubble"
-                  android:supportsRtl="true"
-                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
-
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN" />
-                          <category android:name="android.intent.category.LAUNCHER" />
-                      </intent-filter>
-                  </activity>
-
-                  <service
-                      android:name=".BubbleService"
-                      android:exported="true"
-                      android:configChanges="orientation|screenSize|keyboardHidden"
-                      android:foregroundServiceType="specialUse"
-                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
-                      <intent-filter>
-                          <action android:name="android.service.notification.NotificationListenerService" />
-                      </intent-filter>
-                      <property
-                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                          android:value="chat_bubble_overlay" />
-                  </service>
-
-                  <service
-                      android:name=".ChatSyncService"
-                      android:exported="true"
-                      android:label="SuperBubble Sohbet Eşitleyici"
-                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-                      <intent-filter>
-                          <action android:name="android.accessibilityservice.AccessibilityService" />
-                      </intent-filter>
-                      <meta-data
-                          android:name="android.accessibilityservice"
-                          android:resource="@xml/accessibility_service_config" />
-                  </service>
-              </application>
-          </manifest>"""
-          open("app/src/main/AndroidManifest.xml", "w").write(manifest.strip())
-
-          acc_xml = """<?xml version="1.0" encoding="utf-8"?>
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds"
               android:canRetrieveWindowContent="true"
-              android:notificationTimeout="300"
-              android:packageNames="com.whatsapp,com.whatsapp.w4b,com.instagram.android" />"""
-          open("app/src/main/res/xml/accessibility_service_config.xml", "w").write(acc_xml.strip())
+              android:notificationTimeout="350"
+              android:packageNames="com.whatsapp,com.whatsapp.w4b,com.instagram.android,org.telegram.messenger,org.telegram.messenger.web" />
+          EOF
 
-          bg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
+          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_bg.xml
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
               android:height="108dp"
               android:viewportWidth="108"
               android:viewportHeight="108">
               <path android:fillColor="#0F172A" android:pathData="M0,0h108v108h-108z"/>
               <path android:fillColor="#1E293B" android:pathData="M0,0L108,108L0,108z"/>
-          </vector>"""
-          open("app/src/main/res/drawable/ic_launcher_bg.xml", "w").write(bg.strip())
+          </vector>
+          EOF
 
-          fg = """<vector xmlns:android="http://schemas.android.com/apk/res/android"
+          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_fg.xml
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
               android:height="108dp"
               android:viewportWidth="108"
@@ -121,16 +97,16 @@ jobs:
               <path android:fillColor="#25D366" android:pathData="M42,30 C28,30 18,39 18,51 C18,57 21,62 26,66 L23,76 L34,71 C37,72 39,72 42,72 C56,72 66,63 66,51 C66,39 56,30 42,30 Z"/>
               <path android:fillColor="#0084FF" android:pathData="M64,40 C50,40 40,49 40,61 C40,73 50,82 64,82 C67,82 70,81 73,80 L84,85 L81,75 C86,71 88,66 88,61 C88,49 78,40 64,40 Z"/>
               <path android:fillColor="#FFFFFF" android:pathData="M52,56h24v4h-24zM52,64h16v4h-16z"/>
-          </vector>"""
-          open("app/src/main/res/drawable/ic_launcher_fg.xml", "w").write(fg.strip())
+          </vector>
+          EOF
 
-          adaptive = """<?xml version="1.0" encoding="utf-8"?>
+          cat << 'EOF' > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+          <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@drawable/ic_launcher_bg"/>
               <foreground android:drawable="@drawable/ic_launcher_fg"/>
-          </adaptive-icon>"""
-          open("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "w").write(adaptive.strip())
-          '
+          </adaptive-icon>
+          EOF
 
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
@@ -167,6 +143,7 @@ jobs:
           plugins {
               id 'com.android.application'
               id 'org.jetbrains.kotlin.android'
+              id 'kotlin-kapt'
           }
 
           android {
@@ -177,8 +154,23 @@ jobs:
                   applicationId "com.selim.superbubble"
                   minSdk 26
                   targetSdk 34
-                  versionCode 4
-                  versionName "4.0"
+                  versionCode 5
+                  versionName "5.0"
+              }
+
+              signingConfigs {
+                  debug {
+                      storeFile file("${rootProject.projectDir}/signing/superbubble.keystore")
+                      storePassword System.getenv("KEYSTORE_PASSWORD") ?: "superbubble123"
+                      keyAlias System.getenv("KEY_ALIAS") ?: "superbubble"
+                      keyPassword System.getenv("KEY_PASSWORD") ?: "superbubble123"
+                  }
+              }
+
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.debug
+                  }
               }
 
               compileOptions {
@@ -194,11 +186,16 @@ jobs:
               implementation 'androidx.core:core-ktx:1.12.0'
               implementation 'androidx.appcompat:appcompat:1.6.1'
               implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.recyclerview:recyclerview:1.3.2'
+              implementation 'androidx.room:room-runtime:2.6.1'
+              implementation 'androidx.room:room-ktx:2.6.1'
+              kapt 'androidx.room:room-compiler:2.6.1'
+              testImplementation 'junit:junit:4.13.2'
           }
           EOF
 
-      - name: APK Dosyasini Derle
-        run: gradle assembleDebug
+      - name: Birim Testlerini Calistir ve APK Derle
+        run: gradle testDebugUnitTest assembleDebug
 
       - name: APK Dosyasini Paketle
         uses: actions/upload-artifact@v4
