@@ -29,9 +29,15 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -39,6 +45,10 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.core.view.doOnLayout
+import androidx.dynamicanimation.animation.FloatValueHolder
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -131,6 +141,18 @@ class BubbleService : NotificationListenerService() {
     // Silme (X) Alanı
     private var dismissBarView: FrameLayout? = null
     private lateinit var dismissParams: WindowManager.LayoutParams
+    private var dismissCircle: TextView? = null
+    private var dismissCircleBg: GradientDrawable? = null
+    private var dismissHot = false
+    private var dismissTargetShown = false
+
+    // Yaylanma (spring) animasyonları ve açılış/kapanış animasyonu için
+    private var xSpring: SpringAnimation? = null
+    private var ySpring: SpringAnimation? = null
+    private var bubbleCenterX = 0f
+    private var bubbleCenterY = 0f
+    private var closingOverlay: View? = null
+    private var dimAnimator: ValueAnimator? = null
 
     // Açık Sohbet Penceresi
     private var chatWindowHolder: ChatWindowHolder? = null
@@ -173,7 +195,7 @@ class BubbleService : NotificationListenerService() {
             }
             if (isExpanded) {
                 val currentKey = activeChatKey
-                collapseChat()
+                collapseChat(animated = false)
                 activeChatKey = currentKey
                 openExpandedChat()
             }
@@ -577,7 +599,7 @@ class BubbleService : NotificationListenerService() {
         if (dismissBarView != null || !Settings.canDrawOverlays(this)) return
         dismissParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            dpToPx(90),
+            dpToPx(150),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
@@ -589,30 +611,99 @@ class BubbleService : NotificationListenerService() {
             visibility = View.GONE
         }
 
-        val pill = TextView(this).apply {
+        // Videodaki gibi: altta yuvarlak bir X hedefi. Balon yaklaşınca büyür ve kırmızıya döner.
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor("#E6303134"))
+            setStroke(dpToPx(2), Color.parseColor("#66FFFFFF"))
+        }
+        dismissCircleBg = bg
+
+        val circle = TextView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                dpToPx(48),
-                Gravity.CENTER
-            )
-            text = "✕  Balonu Gizle"
-            textSize = 13.5f
+                dpToPx(60),
+                dpToPx(60),
+                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                bottomMargin = dpToPx(40)
+            }
+            text = "✕"
+            textSize = 22f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            setPadding(dpToPx(20), 0, dpToPx(20), 0)
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#DDFF3B30"))
-                cornerRadius = dpToPx(24).toFloat()
-                setStroke(dpToPx(2), Color.WHITE)
-            }
+            background = bg
+            alpha = 0f
+            scaleX = 0.6f
+            scaleY = 0.6f
         }
+        dismissCircle = circle
 
-        dismissBarView?.addView(pill)
+        dismissBarView?.addView(circle)
         try {
             windowManager.addView(dismissBarView, dismissParams)
         } catch (_: Exception) {
             dismissBarView = null
+            dismissCircle = null
+            dismissCircleBg = null
+        }
+    }
+
+    // Sürükleme başlayınca X hedefi yaylanarak belirir
+    private fun showDismissTarget() {
+        val circle = dismissCircle ?: return
+        dismissTargetShown = true
+        dismissBarView?.visibility = View.VISIBLE
+        circle.animate().cancel()
+        circle.animate()
+            .alpha(1f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(200L)
+            .setInterpolator(OvershootInterpolator(1.4f))
+            .start()
+    }
+
+    // Bırakınca X hedefi küçülüp kaybolur
+    private fun hideDismissTarget() {
+        dismissTargetShown = false
+        setDismissHot(false)
+        val circle = dismissCircle
+        if (circle == null) {
+            dismissBarView?.visibility = View.GONE
+            return
+        }
+        circle.animate().cancel()
+        circle.animate()
+            .alpha(0f)
+            .scaleX(0.6f)
+            .scaleY(0.6f)
+            .setDuration(150L)
+            .setInterpolator(AccelerateInterpolator())
+            .withEndAction {
+                if (!dismissTargetShown) {
+                    dismissBarView?.visibility = View.GONE
+                }
+            }
+            .start()
+    }
+
+    // Balon X'in yakınına gelince X büyür ve kırmızıya döner
+    private fun setDismissHot(hot: Boolean) {
+        if (dismissHot == hot) return
+        dismissHot = hot
+        val circle = dismissCircle ?: return
+        dismissCircleBg?.setColor(Color.parseColor(if (hot) "#FFFF3B30" else "#E6303134"))
+        circle.animate().cancel()
+        circle.animate()
+            .scaleX(if (hot) 1.3f else 1f)
+            .scaleY(if (hot) 1.3f else 1f)
+            .setDuration(140L)
+            .start()
+        if (hot) {
+            try {
+                circle.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            } catch (_: Exception) {}
         }
     }
 
@@ -622,38 +713,126 @@ class BubbleService : NotificationListenerService() {
         var touchX = 0f
         var touchY = 0f
         var isDragging = false
+        var wasHot = false
+        var originOffsetX = 0
+        var originOffsetY = 0
+        var tracker: VelocityTracker? = null
+        val maxFling = ViewConfiguration.get(this).scaledMaximumFlingVelocity.toFloat()
+
+        // Hızı ekran koordinatıyla ölç (pencere parmakla birlikte kaydığı için event.x işe yaramaz)
+        fun track(event: MotionEvent) {
+            val t = tracker ?: return
+            val copy = MotionEvent.obtain(event)
+            copy.setLocation(event.rawX, event.rawY)
+            t.addMovement(copy)
+            copy.recycle()
+        }
 
         bubbleView?.setOnTouchListener { _, event ->
+            val b = bubbleView ?: return@setOnTouchListener false
             val metrics = resources.displayMetrics
             val bSize = SettingsManager.getBubbleSizeDp(this)
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
+                    xSpring?.cancel()
+                    ySpring?.cancel()
                     startX = bubbleParams.x
                     startY = bubbleParams.y
                     touchX = event.rawX
                     touchY = event.rawY
                     isDragging = false
+                    wasHot = false
+
+                    tracker?.recycle()
+                    tracker = VelocityTracker.obtain()
+                    track(event)
+
+                    // Pencere koordinatı ile ekran koordinatı arasındaki farkı öğren (durum çubuğu vb.)
+                    val loc = IntArray(2)
+                    b.getLocationOnScreen(loc)
+                    originOffsetX = loc[0] - bubbleParams.x
+                    originOffsetY = loc[1] - bubbleParams.y
+
+                    // Basınca hafifçe küçül
+                    b.animate().cancel()
+                    b.animate().scaleX(0.92f).scaleY(0.92f).setDuration(90L).start()
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    track(event)
                     val dx = (event.rawX - touchX).toInt()
                     val dy = (event.rawY - touchY).toInt()
-                    if (abs(dx) > 12 || abs(dy) > 12) {
+                    if (!isDragging && (abs(dx) > 12 || abs(dy) > 12)) {
                         isDragging = true
-                        dismissBarView?.visibility = View.VISIBLE
+                        showDismissTarget()
+                        b.animate().cancel()
+                        b.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
                     }
                     if (isDragging) {
-                        bubbleParams.x = max(0, min(metrics.widthPixels - dpToPx(bSize), startX + dx))
-                        bubbleParams.y = max(dpToPx(24), min(metrics.heightPixels - dpToPx(bSize + 12), startY + dy))
+                        val sizePx = dpToPx(bSize)
+                        var hot = false
+                        var cx = 0f
+                        var cy = 0f
+                        val circle = dismissCircle
+                        val bar = dismissBarView
+                        if (circle != null && bar != null && circle.width > 0) {
+                            // Büyüme/küçülme animasyonu konumu kaydırmasın diye kapsayıcının konumuna göre hesapla
+                            val cl = IntArray(2)
+                            bar.getLocationOnScreen(cl)
+                            cx = cl[0] + circle.left + circle.width / 2f
+                            cy = cl[1] + circle.top + circle.height / 2f
+                            val ddx = event.rawX - cx
+                            val ddy = event.rawY - cy
+                            val radius = dpToPx(90).toFloat()
+                            hot = ddx * ddx + ddy * ddy < radius * radius
+                        }
+                        setDismissHot(hot)
+
+                        if (hot != wasHot) {
+                            wasHot = hot
+                            b.animate().cancel()
+                            b.animate()
+                                .scaleX(if (hot) 0.8f else 1f)
+                                .scaleY(if (hot) 0.8f else 1f)
+                                .setDuration(120L)
+                                .start()
+                        }
+
+                        if (hot) {
+                            // Mıknatıs: balon X'in merkezine doğru çekilir
+                            val tx = (cx - sizePx / 2f).toInt() - originOffsetX
+                            val ty = (cy - sizePx / 2f).toInt() - originOffsetY
+                            bubbleParams.x += ((tx - bubbleParams.x) * 0.45f).toInt()
+                            bubbleParams.y += ((ty - bubbleParams.y) * 0.45f).toInt()
+                        } else {
+                            bubbleParams.x = max(0, min(metrics.widthPixels - sizePx, startX + dx))
+                            bubbleParams.y = max(dpToPx(24), min(metrics.heightPixels - dpToPx(bSize + 12), startY + dy))
+                        }
                         try {
-                            windowManager.updateViewLayout(bubbleView, bubbleParams)
+                            windowManager.updateViewLayout(b, bubbleParams)
                         } catch (_: Exception) {}
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    dismissBarView?.visibility = View.GONE
+                    track(event)
+                    var vx = 0f
+                    var vy = 0f
+                    val t = tracker
+                    if (t != null) {
+                        t.computeCurrentVelocity(1000, maxFling)
+                        vx = t.xVelocity
+                        vy = t.yVelocity
+                        t.recycle()
+                    }
+                    tracker = null
+
+                    val droppedOnTarget = dismissHot
+                    hideDismissTarget()
+
                     if (!isDragging) {
+                        b.animate().cancel()
+                        b.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
                         val callingSession = activeSessions.values.firstOrNull { it.isIncomingCall && it.callIntent != null }
                         if (callingSession != null) {
                             if (sendPendingIntentSafely(callingSession.callIntent)) {
@@ -663,19 +842,32 @@ class BubbleService : NotificationListenerService() {
                             }
                         }
                         openExpandedChat()
-                    } else {
-                        if (event.rawY > metrics.heightPixels * 0.82f) {
-                            activeSessions.clear()
-                            destroyAllOverlays()
-                        } else {
-                            val targetX = if (bubbleParams.x + dpToPx(bSize / 2) < metrics.widthPixels / 2) {
-                                dpToPx(8)
-                            } else {
-                                metrics.widthPixels - dpToPx(bSize + 8)
+                    } else if (droppedOnTarget) {
+                        // X'in içine düştü: küçülüp kaybol, sonra kapat
+                        b.animate().cancel()
+                        b.animate()
+                            .scaleX(0f)
+                            .scaleY(0f)
+                            .alpha(0f)
+                            .setDuration(160L)
+                            .withEndAction {
+                                activeSessions.clear()
+                                destroyAllOverlays()
                             }
-                            animateBubbleToEdge(bubbleParams.x, targetX)
-                        }
+                            .start()
+                    } else {
+                        b.animate().cancel()
+                        b.animate().scaleX(1f).scaleY(1f).setDuration(120L).start()
+                        springBubbleToEdge(vx, vy)
                     }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    tracker?.recycle()
+                    tracker = null
+                    hideDismissTarget()
+                    b.animate().cancel()
+                    b.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
                     true
                 }
                 else -> false
@@ -683,12 +875,55 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
-    private fun animateBubbleToEdge(fromX: Int, toX: Int) {
-        ValueAnimator.ofInt(fromX, toX).apply {
-            duration = 200
-            addUpdateListener { anim ->
+    // Balonu bırakıldığı hıza göre kenara yaylanarak yapıştırır
+    private fun springBubbleToEdge(vx: Float, vy: Float) {
+        val metrics = resources.displayMetrics
+        val bSize = SettingsManager.getBubbleSizeDp(this)
+        val sizePx = dpToPx(bSize)
+        val margin = dpToPx(8)
+        val minY = dpToPx(24)
+        val maxY = max(minY, metrics.heightPixels - dpToPx(bSize + 12))
+
+        // Fırlatma hızına bakarak hangi kenara gideceğini tahmin et
+        val projectedCenterX = bubbleParams.x + sizePx / 2f + vx * 0.12f
+        val targetX = if (projectedCenterX < metrics.widthPixels / 2f) {
+            margin
+        } else {
+            metrics.widthPixels - sizePx - margin
+        }
+        val targetY = (bubbleParams.y + vy * 0.10f).toInt().coerceIn(minY, maxY)
+
+        xSpring?.cancel()
+        ySpring?.cancel()
+
+        xSpring = SpringAnimation(FloatValueHolder(bubbleParams.x.toFloat())).apply {
+            setSpring(
+                SpringForce(targetX.toFloat())
+                    .setDampingRatio(0.65f)
+                    .setStiffness(400f)
+            )
+            setStartVelocity(vx)
+            addUpdateListener { _, value, _ ->
                 if (bubbleView != null) {
-                    bubbleParams.x = anim.animatedValue as Int
+                    bubbleParams.x = value.toInt().coerceIn(0, max(0, metrics.widthPixels - sizePx))
+                    try {
+                        windowManager.updateViewLayout(bubbleView, bubbleParams)
+                    } catch (_: Exception) {}
+                }
+            }
+            start()
+        }
+
+        ySpring = SpringAnimation(FloatValueHolder(bubbleParams.y.toFloat())).apply {
+            setSpring(
+                SpringForce(targetY.toFloat())
+                    .setDampingRatio(1f)
+                    .setStiffness(200f)
+            )
+            setStartVelocity(vy)
+            addUpdateListener { _, value, _ ->
+                if (bubbleView != null) {
+                    bubbleParams.y = value.toInt().coerceIn(minY, maxY)
                     try {
                         windowManager.updateViewLayout(bubbleView, bubbleParams)
                     } catch (_: Exception) {}
@@ -752,6 +987,12 @@ class BubbleService : NotificationListenerService() {
         if (isExpanded || activeSessions.isEmpty() || !Settings.canDrawOverlays(this)) return
         isExpanded = true
 
+        // Sohbetin büyüyerek açılacağı nokta: balonun merkezi
+        val bLoc = IntArray(2)
+        bubbleView?.getLocationOnScreen(bLoc)
+        bubbleCenterX = bLoc[0] + (bubbleView?.width ?: 0) / 2f
+        bubbleCenterY = bLoc[1] + (bubbleView?.height ?: 0) / 2f
+
         bubbleView?.visibility = View.GONE
 
         expandedParams = WindowManager.LayoutParams(
@@ -761,7 +1002,7 @@ class BubbleService : NotificationListenerService() {
             WindowManager.LayoutParams.FLAG_DIM_BEHIND,
             PixelFormat.TRANSLUCENT
         ).apply {
-            dimAmount = 0.55f
+            dimAmount = 0f
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
@@ -811,9 +1052,14 @@ class BubbleService : NotificationListenerService() {
         )
 
         chatWindowHolder = holder
+        // Küçük ve görünmez başla; playOpenAnimation balonun yerinden büyütecek
+        view.alpha = 0f
+        view.scaleX = 0.15f
+        view.scaleY = 0.15f
         try {
             windowManager.addView(view, expandedParams)
             refreshExpandedUI(forceScrollBottom = true)
+            playOpenAnimation(view)
         } catch (_: Exception) {
             isExpanded = false
             chatWindowHolder = null
@@ -1195,7 +1441,7 @@ class BubbleService : NotificationListenerService() {
         }, delayMs)
     }
 
-    private fun collapseChat() {
+    private fun collapseChat(animated: Boolean = true) {
         if (!isExpanded) return
         isExpanded = false
         stopAudio()
@@ -1205,22 +1451,114 @@ class BubbleService : NotificationListenerService() {
             imm.hideSoftInputFromWindow(chatWindowHolder?.replyEdit?.windowToken, 0)
         } catch (_: Exception) {}
 
-        chatWindowHolder?.rootOverlay?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
+        val overlay = chatWindowHolder?.rootOverlay
         chatWindowHolder = null
 
-        bubbleView?.visibility = View.VISIBLE
-        activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
+        val finish: () -> Unit = {
+            if (overlay != null) {
+                try { windowManager.removeView(overlay) } catch (_: Exception) {}
+            }
+            if (closingOverlay === overlay) closingOverlay = null
+            if (!isExpanded) {
+                val b = bubbleView
+                if (b != null) {
+                    // Balon küçükten yaylanarak geri belirir
+                    b.visibility = View.VISIBLE
+                    b.scaleX = 0.7f
+                    b.scaleY = 0.7f
+                    b.animate().cancel()
+                    b.animate()
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(220L)
+                        .setInterpolator(OvershootInterpolator(2f))
+                        .start()
+                }
+                activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
+            }
+        }
+
+        if (!animated || overlay == null || !overlay.isAttachedToWindow) {
+            finish()
+            return
+        }
+
+        // Sohbet küçülerek balonun içine geri çekilir
+        closingOverlay = overlay
+        overlay.animate().cancel()
+        overlay.animate()
+            .alpha(0f)
+            .scaleX(0.15f)
+            .scaleY(0.15f)
+            .setDuration(200L)
+            .setInterpolator(AccelerateInterpolator(1.4f))
+            .withEndAction { finish() }
+            .start()
+        animateDim(0.55f, 0f, 200L, overlay)
+    }
+
+    // Sohbet penceresi balonun bulunduğu yerden büyüyerek açılır
+    private fun playOpenAnimation(view: View) {
+        view.doOnLayout { v ->
+            // getLocationOnScreen ölçeği hesaba kattığı için, konumu ölçerken ölçeği geçici olarak 1 yap
+            v.scaleX = 1f
+            v.scaleY = 1f
+            val loc = IntArray(2)
+            v.getLocationOnScreen(loc)
+            v.pivotX = (bubbleCenterX - loc[0]).coerceIn(0f, v.width.toFloat())
+            v.pivotY = (bubbleCenterY - loc[1]).coerceIn(0f, v.height.toFloat())
+            v.scaleX = 0.15f
+            v.scaleY = 0.15f
+            v.animate().cancel()
+            v.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(260L)
+                .setInterpolator(DecelerateInterpolator(1.6f))
+                .start()
+            animateDim(0f, 0.55f, 260L, v)
+        }
+    }
+
+    // Arkadaki kararma (dim) yumuşakça belirir / kaybolur
+    private fun animateDim(from: Float, to: Float, durationMs: Long, view: View) {
+        dimAnimator?.cancel()
+        dimAnimator = ValueAnimator.ofFloat(from, to).apply {
+            duration = durationMs
+            addUpdateListener { a ->
+                if (!view.isAttachedToWindow) {
+                    a.cancel()
+                } else {
+                    expandedParams.dimAmount = a.animatedValue as Float
+                    try {
+                        windowManager.updateViewLayout(view, expandedParams)
+                    } catch (_: Exception) {}
+                }
+            }
+            start()
+        }
     }
 
     private fun destroyAllOverlays() {
         isExpanded = false
         stopAudio()
+        xSpring?.cancel()
+        ySpring?.cancel()
+        xSpring = null
+        ySpring = null
+        dimAnimator?.cancel()
+        dimAnimator = null
+
         chatWindowHolder?.rootOverlay?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
         chatWindowHolder = null
+
+        closingOverlay?.let {
+            try { windowManager.removeView(it) } catch (_: Exception) {}
+        }
+        closingOverlay = null
 
         bubbleView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
@@ -1231,6 +1569,10 @@ class BubbleService : NotificationListenerService() {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
         dismissBarView = null
+        dismissCircle = null
+        dismissCircleBg = null
+        dismissHot = false
+        dismissTargetShown = false
         activeChatKey = null
     }
 
