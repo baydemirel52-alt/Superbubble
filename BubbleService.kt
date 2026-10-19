@@ -51,7 +51,6 @@ import androidx.core.view.doOnLayout
 import androidx.dynamicanimation.animation.FloatValueHolder
 import androidx.dynamicanimation.animation.SpringAnimation
 import androidx.dynamicanimation.animation.SpringForce
-import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -153,11 +152,12 @@ class BubbleService : NotificationListenerService() {
     private var ySpring: SpringAnimation? = null
     private var bubbleCenterX = 0f
     private var bubbleCenterY = 0f
-    private var closingOverlay: View? = null
-    private var dimAnimator: ValueAnimator? = null
+    private var closingWrapper: View? = null
     private var closeAnimator: ValueAnimator? = null
 
     // Açık Sohbet Penceresi
+    private var expandedRootWrapper: FrameLayout? = null
+    private var dimScrimView: View? = null
     private var chatWindowHolder: ChatWindowHolder? = null
     private lateinit var expandedParams: WindowManager.LayoutParams
     private var isExpanded = false
@@ -227,107 +227,107 @@ class BubbleService : NotificationListenerService() {
         repository.ioExecutor.execute {
             // Arka plan thread'inde yakalanmayan tek bir hata bile uygulamayı çökertir, o yüzden her şey try/catch içinde.
             try {
-            val parsed = NotificationParser.parse(this, sbn, repository) ?: return@execute
-            when (parsed) {
-                is ParsedNotification.RemoteReplyConfirmation -> {
-                    if (parsed.confirmedTexts.isNotEmpty()) {
-                        repository.markDeliveredAsync(parsed.chatKey, parsed.confirmedTexts) {
-                            mainHandler.post {
-                                val sess = activeSessions[parsed.chatKey]
-                                if (sess != null) {
-                                    for (i in sess.messages.indices) {
-                                        val m = sess.messages[i]
-                                        if (m.isMe && parsed.confirmedTexts.contains(m.text)) {
-                                            sess.messages[i] = m.copy(isDelivered = true)
+                val parsed = NotificationParser.parse(this, sbn, repository) ?: return@execute
+                when (parsed) {
+                    is ParsedNotification.RemoteReplyConfirmation -> {
+                        if (parsed.confirmedTexts.isNotEmpty()) {
+                            repository.markDeliveredAsync(parsed.chatKey, parsed.confirmedTexts) {
+                                mainHandler.post {
+                                    val sess = activeSessions[parsed.chatKey]
+                                    if (sess != null) {
+                                        for (i in sess.messages.indices) {
+                                            val m = sess.messages[i]
+                                            if (m.isMe && parsed.confirmedTexts.contains(m.text)) {
+                                                sess.messages[i] = m.copy(isDelivered = true)
+                                            }
                                         }
-                                    }
-                                    if (isExpanded && activeChatKey == parsed.chatKey) {
-                                        refreshExpandedUI(forceScrollBottom = false)
+                                        if (isExpanded && activeChatKey == parsed.chatKey) {
+                                            refreshExpandedUI(forceScrollBottom = false)
+                                        }
                                     }
                                 }
                             }
                         }
+                        scheduleCancelNotification(parsed.sbnKey, 350)
                     }
-                    scheduleCancelNotification(parsed.sbnKey, 350)
-                }
 
-                is ParsedNotification.IncomingCall -> {
-                    if (!SettingsManager.shouldShowNotification(this, parsed.pkgName, parsed.sender)) return@execute
-                    val now = System.currentTimeMillis()
-                    val callMsg = ChatMessage(
-                        id = NotificationParser.buildMessageId(now, parsed.sender, false, parsed.callDescription),
-                        chatKey = parsed.chatKey,
-                        senderName = null,
-                        text = parsed.callDescription,
-                        isMe = false,
-                        time = NotificationParser.formatTime(now),
-                        timestamp = now
-                    )
-                    mainHandler.post {
-                        onNewMessage(
+                    is ParsedNotification.IncomingCall -> {
+                        if (!SettingsManager.shouldShowNotification(this, parsed.pkgName, parsed.sender)) return@execute
+                        val now = System.currentTimeMillis()
+                        val callMsg = ChatMessage(
+                            id = NotificationParser.buildMessageId(now, parsed.sender, false, parsed.callDescription),
                             chatKey = parsed.chatKey,
-                            sbnKey = parsed.sbnKey,
-                            shortcutId = null,
-                            whatsappJid = null,
-                            pkgName = parsed.pkgName,
-                            sender = parsed.sender,
-                            messagesBatch = listOf(callMsg),
-                            appName = parsed.appName,
-                            avatar = parsed.avatar,
-                            replyAction = null,
-                            contentIntent = parsed.contentIntent,
-                            callIntent = parsed.callIntent,
-                            isIncomingCall = true
+                            senderName = null,
+                            text = parsed.callDescription,
+                            isMe = false,
+                            time = NotificationParser.formatTime(now),
+                            timestamp = now
                         )
+                        mainHandler.post {
+                            onNewMessage(
+                                chatKey = parsed.chatKey,
+                                sbnKey = parsed.sbnKey,
+                                shortcutId = null,
+                                whatsappJid = null,
+                                pkgName = parsed.pkgName,
+                                sender = parsed.sender,
+                                messagesBatch = listOf(callMsg),
+                                appName = parsed.appName,
+                                avatar = parsed.avatar,
+                                replyAction = null,
+                                contentIntent = parsed.contentIntent,
+                                callIntent = parsed.callIntent,
+                                isIncomingCall = true
+                            )
+                        }
                     }
-                }
 
-                is ParsedNotification.IncomingMessages -> {
-                    if (!SettingsManager.shouldShowNotification(this, parsed.pkgName, parsed.sender)) return@execute
-                    mainHandler.post {
-                        onNewMessage(
-                            chatKey = parsed.chatKey,
-                            sbnKey = parsed.sbnKey,
-                            shortcutId = parsed.shortcutId,
-                            whatsappJid = parsed.whatsappJid,
-                            pkgName = parsed.pkgName,
-                            sender = parsed.sender,
-                            messagesBatch = parsed.messages,
-                            appName = parsed.appName,
-                            avatar = parsed.avatar,
-                            replyAction = parsed.replyAction,
-                            contentIntent = parsed.contentIntent,
-                            callIntent = null,
-                            isIncomingCall = false
-                        )
+                    is ParsedNotification.IncomingMessages -> {
+                        if (!SettingsManager.shouldShowNotification(this, parsed.pkgName, parsed.sender)) return@execute
+                        mainHandler.post {
+                            onNewMessage(
+                                chatKey = parsed.chatKey,
+                                sbnKey = parsed.sbnKey,
+                                shortcutId = parsed.shortcutId,
+                                whatsappJid = parsed.whatsappJid,
+                                pkgName = parsed.pkgName,
+                                sender = parsed.sender,
+                                messagesBatch = parsed.messages,
+                                appName = parsed.appName,
+                                avatar = parsed.avatar,
+                                replyAction = parsed.replyAction,
+                                contentIntent = parsed.contentIntent,
+                                callIntent = null,
+                                isIncomingCall = false
+                            )
 
-                        if (parsed.needsWhatsAppMediaFallback) {
-                            mainHandler.postDelayed({
-                                repository.ioExecutor.execute {
-                                    val waPhotoPath = repository.fetchLatestWhatsAppPhoto(this, parsed.postTimeSec)
-                                    if (waPhotoPath != null) {
-                                        mainHandler.post {
-                                            val sess = activeSessions[parsed.chatKey]
-                                            val lastIdx = sess?.messages?.lastIndex ?: -1
-                                            if (sess != null && lastIdx >= 0) {
-                                                val last = sess.messages[lastIdx]
-                                                if (!last.isMe && last.imagePath == null) {
-                                                    val updated = last.copy(imagePath = waPhotoPath)
-                                                    sess.messages[lastIdx] = updated
-                                                    repository.saveMessagesAsync(parsed.chatKey, listOf(updated))
-                                                    if (isExpanded && activeChatKey == parsed.chatKey) {
-                                                        refreshExpandedUI(forceScrollBottom = false)
+                            if (parsed.needsWhatsAppMediaFallback) {
+                                mainHandler.postDelayed({
+                                    repository.ioExecutor.execute {
+                                        val waPhotoPath = repository.fetchLatestWhatsAppPhoto(this, parsed.postTimeSec)
+                                        if (waPhotoPath != null) {
+                                            mainHandler.post {
+                                                val sess = activeSessions[parsed.chatKey]
+                                                val lastIdx = sess?.messages?.lastIndex ?: -1
+                                                if (sess != null && lastIdx >= 0) {
+                                                    val last = sess.messages[lastIdx]
+                                                    if (!last.isMe && last.imagePath == null) {
+                                                        val updated = last.copy(imagePath = waPhotoPath)
+                                                        sess.messages[lastIdx] = updated
+                                                        repository.saveMessagesAsync(parsed.chatKey, listOf(updated))
+                                                        if (isExpanded && activeChatKey == parsed.chatKey) {
+                                                            refreshExpandedUI(forceScrollBottom = false)
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            }, 1100)
+                                }, 1100)
+                            }
                         }
                     }
                 }
-            }
             } catch (e: Exception) {
                 Log.e("SuperBubble", "Bildirim islenirken hata", e)
             }
@@ -732,6 +732,7 @@ class BubbleService : NotificationListenerService() {
         }
 
         bubbleView?.setOnTouchListener { _, event ->
+            if (isExpanded) return@setOnTouchListener false
             val b = bubbleView ?: return@setOnTouchListener false
             val metrics = resources.displayMetrics
             val bSize = SettingsManager.getBubbleSizeDp(this)
@@ -751,6 +752,8 @@ class BubbleService : NotificationListenerService() {
                     track(event)
 
                     // Pencere koordinatı ile ekran koordinatı arasındaki farkı öğren (durum çubuğu vb.)
+                    b.scaleX = 1f
+                    b.scaleY = 1f
                     val loc = IntArray(2)
                     b.getLocationOnScreen(loc)
                     originOffsetX = loc[0] - bubbleParams.x
@@ -835,7 +838,8 @@ class BubbleService : NotificationListenerService() {
 
                     if (!isDragging) {
                         b.animate().cancel()
-                        b.animate().scaleX(1f).scaleY(1f).setDuration(90L).start()
+                        b.scaleX = 1f
+                        b.scaleY = 1f
                         val callingSession = activeSessions.values.firstOrNull { it.isIncomingCall && it.callIntent != null }
                         if (callingSession != null) {
                             if (sendPendingIntentSafely(callingSession.callIntent)) {
@@ -985,33 +989,72 @@ class BubbleService : NotificationListenerService() {
         }
     }
 
+    // Balonun ekrandaki güncel merkez koordinatını hesaplar
+    private fun updateBubbleCenterCoords() {
+        val b = bubbleView
+        val bSizePx = dpToPx(SettingsManager.getBubbleSizeDp(this))
+        if (b != null && b.isAttachedToWindow && b.width > 0) {
+            val prevScaleX = b.scaleX
+            val prevScaleY = b.scaleY
+            b.scaleX = 1f
+            b.scaleY = 1f
+            val bLoc = IntArray(2)
+            b.getLocationOnScreen(bLoc)
+            bubbleCenterX = bLoc[0] + b.width / 2f
+            bubbleCenterY = bLoc[1] + b.height / 2f
+            b.scaleX = prevScaleX
+            b.scaleY = prevScaleY
+        } else if (::bubbleParams.isInitialized) {
+            bubbleCenterX = bubbleParams.x + bSizePx / 2f
+            bubbleCenterY = bubbleParams.y + bSizePx / 2f
+        }
+    }
+
     // ==================== 2. AÇIK SOHBET PENCERESİ ====================
     private fun openExpandedChat() {
         if (isExpanded || activeSessions.isEmpty() || !Settings.canDrawOverlays(this)) return
         isExpanded = true
 
+        // Önceki kapanış animasyonu hala sürüyorsa anında temizle
+        closeAnimator?.cancel()
+        closeAnimator = null
+        closingWrapper?.let {
+            try { windowManager.removeView(it) } catch (_: Exception) {}
+        }
+        closingWrapper = null
+
         // Sohbetin büyüyerek açılacağı nokta: balonun merkezi
-        val bLoc = IntArray(2)
-        bubbleView?.getLocationOnScreen(bLoc)
-        bubbleCenterX = bLoc[0] + (bubbleView?.width ?: 0) / 2f
-        bubbleCenterY = bLoc[1] + (bubbleView?.height ?: 0) / 2f
+        updateBubbleCenterCoords()
 
-        bubbleView?.visibility = View.GONE
+        // KRİTİK: bubbleView'a ASLA View.GONE vermiyoruz! View.GONE verirsek WindowManager balonun
+        // SurfaceControl yüzeyini yok eder ve kapanışta yeniden oluştururken 1 sn gecikme yaşatır.
+        // Bunun yerine balonu RenderThread üzerinde alpha/scale ile gizliyoruz.
+        bubbleView?.let { b ->
+            b.animate().cancel()
+            b.visibility = View.VISIBLE
+            b.animate()
+                .alpha(0f)
+                .scaleX(0.5f)
+                .scaleY(0.5f)
+                .setDuration(120L)
+                .start()
+        }
 
+        // FLAG_DIM_BEHIND kullanmıyoruz; çünkü dimAmount için her karede updateViewLayout çağırmak
+        // WindowManagerService'i kilitler. Karartmayı donanım hızlandırmalı dimScrimView ile yapıyoruz.
         expandedParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_DIM_BEHIND,
+            0,
             PixelFormat.TRANSLUCENT
         ).apply {
-            dimAmount = 0f
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         }
 
         val holder = ChatWindowHolder(this, repository)
-        val view = holder.build(
+        val chatContentView = holder.build(
             onCollapse = { collapseChat() },
             onCloseAll = {
                 activeSessions.clear()
@@ -1054,18 +1097,45 @@ class BubbleService : NotificationListenerService() {
             onStartVoiceDictation = { startVoiceDictation() }
         )
 
+        val scrim = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundColor(Color.parseColor("#8C000000"))
+            alpha = 0f
+        }
+
+        val wrapper = FrameLayout(this).apply {
+            addView(scrim)
+            addView(
+                chatContentView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+        }
+
         chatWindowHolder = holder
+        dimScrimView = scrim
+        expandedRootWrapper = wrapper
+
         // Küçük ve görünmez başla; playOpenAnimation balonun yerinden büyütecek
-        view.alpha = 0f
-        view.scaleX = 0.15f
-        view.scaleY = 0.15f
+        chatContentView.alpha = 0f
+        chatContentView.scaleX = 0.12f
+        chatContentView.scaleY = 0.12f
+
         try {
-            windowManager.addView(view, expandedParams)
+            windowManager.addView(wrapper, expandedParams)
             refreshExpandedUI(forceScrollBottom = true)
-            playOpenAnimation(view)
+            playOpenAnimation(wrapper, chatContentView, scrim)
         } catch (_: Exception) {
             isExpanded = false
             chatWindowHolder = null
+            dimScrimView = null
+            expandedRootWrapper = null
+            showBubbleAgain(animated = false)
         }
     }
 
@@ -1243,7 +1313,7 @@ class BubbleService : NotificationListenerService() {
                 }
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            collapseChat()
+            collapseChat(animated = false)
             startActivity(shareIntent)
         } catch (_: Exception) {
             openOriginalApp()
@@ -1255,7 +1325,7 @@ class BubbleService : NotificationListenerService() {
 
         if (active.isIncomingCall && active.callIntent != null) {
             if (sendPendingIntentSafely(active.callIntent)) {
-                collapseChat()
+                collapseChat(animated = false)
                 return
             }
         }
@@ -1277,7 +1347,7 @@ class BubbleService : NotificationListenerService() {
                         setPackage(active.pkgName)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    collapseChat()
+                    collapseChat(animated = false)
                     startActivity(callIntent)
                     return
                 } catch (_: Exception) {}
@@ -1357,7 +1427,7 @@ class BubbleService : NotificationListenerService() {
 
     private fun openOriginalApp() {
         val active = activeSessions[activeChatKey] ?: return
-        collapseChat()
+        collapseChat(animated = false)
 
         if (active.isIncomingCall && sendPendingIntentSafely(active.callIntent)) {
             return
@@ -1454,98 +1524,115 @@ class BubbleService : NotificationListenerService() {
             imm.hideSoftInputFromWindow(chatWindowHolder?.replyEdit?.windowToken, 0)
         } catch (_: Exception) {}
 
-        val overlay = chatWindowHolder?.rootOverlay
+        val wrapper = expandedRootWrapper
+        val content = chatWindowHolder?.rootOverlay
+        val scrim = dimScrimView
+
+        expandedRootWrapper = null
         chatWindowHolder = null
+        dimScrimView = null
 
-        // Balonu hemen göster. Sohbet küçülürken altından balon görünür; böylece sohbet
-        // kaybolup balon sonradan belirirken oluşan boşluk (titreme) olmaz.
-        showBubbleAgain()
-
-        if (overlay == null) return
-        if (!animated || !overlay.isAttachedToWindow) {
-            try { windowManager.removeView(overlay) } catch (_: Exception) {}
+        if (wrapper == null || content == null || !animated || !wrapper.isAttachedToWindow) {
+            showBubbleAgain(animated = false)
+            if (wrapper != null) {
+                try { windowManager.removeView(wrapper) } catch (_: Exception) {}
+            }
             return
         }
 
-        // Sohbet balonun içine doğru küçülür; solma sadece son kısımda olur
-        closingOverlay = overlay
-        overlay.animate().cancel()
-        val startScale = overlay.scaleX
-        val startAlpha = overlay.alpha
+        // Klavye açılıp kapandıysa boyut değiştiği için balonun merkezini yeniden pivot olarak ata
+        updateBubbleCenterCoords()
+        val wLoc = IntArray(2)
+        wrapper.getLocationOnScreen(wLoc)
+        if (content.width > 0 && content.height > 0) {
+            content.pivotX = (bubbleCenterX - wLoc[0]).coerceIn(0f, content.width.toFloat())
+            content.pivotY = (bubbleCenterY - wLoc[1]).coerceIn(0f, content.height.toFloat())
+        }
+
+        // Balonun SurfaceControl yüzeyi zaten hazır olduğu için sıfır gecikmeyle yaylanarak belirir
+        showBubbleAgain(animated = true)
+
+        closingWrapper = wrapper
+        content.animate().cancel()
+        scrim?.animate()?.cancel()
+
+        val startScale = content.scaleX
+        val startAlpha = content.alpha
+        val startScrimAlpha = scrim?.alpha ?: 1f
+
         closeAnimator?.cancel()
         closeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 220L
-            interpolator = AccelerateInterpolator(1.4f)
+            duration = 210L
+            interpolator = AccelerateInterpolator(1.3f)
             addUpdateListener { a ->
                 val p = a.animatedValue as Float
-                val sc = startScale + (0.15f - startScale) * p
-                overlay.scaleX = sc
-                overlay.scaleY = sc
-                val fade = ((p - 0.6f) / 0.4f).coerceIn(0f, 1f)
-                overlay.alpha = startAlpha * (1f - fade)
+                val sc = startScale + (0.12f - startScale) * p
+                content.scaleX = sc
+                content.scaleY = sc
+                val fade = ((p - 0.45f) / 0.55f).coerceIn(0f, 1f)
+                content.alpha = startAlpha * (1f - fade)
+                scrim?.alpha = startScrimAlpha * (1f - p)
             }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
-                    try { windowManager.removeView(overlay) } catch (_: Exception) {}
-                    if (closingOverlay === overlay) closingOverlay = null
+                    try { windowManager.removeView(wrapper) } catch (_: Exception) {}
+                    if (closingWrapper === wrapper) closingWrapper = null
                 }
             })
             start()
         }
-        animateDim(0.55f, 0f, 220L, overlay)
     }
 
-    // Balonu tam boyutta, hemen görünür yapar
-    private fun showBubbleAgain() {
+    // Balonu WindowManager relayout beklemeden doğrudan GPU üzerinde görünür yapar
+    private fun showBubbleAgain(animated: Boolean = true) {
         val b = bubbleView ?: return
         b.animate().cancel()
-        b.scaleX = 1f
-        b.scaleY = 1f
-        b.alpha = 1f
         b.visibility = View.VISIBLE
         activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
-    }
 
-    // Sohbet penceresi balonun bulunduğu yerden büyüyerek açılır
-    private fun playOpenAnimation(view: View) {
-        view.doOnLayout { v ->
-            // getLocationOnScreen ölçeği hesaba kattığı için, konumu ölçerken ölçeği geçici olarak 1 yap
-            v.scaleX = 1f
-            v.scaleY = 1f
-            val loc = IntArray(2)
-            v.getLocationOnScreen(loc)
-            v.pivotX = (bubbleCenterX - loc[0]).coerceIn(0f, v.width.toFloat())
-            v.pivotY = (bubbleCenterY - loc[1]).coerceIn(0f, v.height.toFloat())
-            v.scaleX = 0.15f
-            v.scaleY = 0.15f
-            v.animate().cancel()
-            v.animate()
+        if (animated) {
+            b.scaleX = 0.55f
+            b.scaleY = 0.55f
+            b.alpha = 0f
+            b.animate()
                 .alpha(1f)
                 .scaleX(1f)
                 .scaleY(1f)
-                .setDuration(260L)
-                .setInterpolator(DecelerateInterpolator(1.6f))
+                .setDuration(200L)
+                .setInterpolator(OvershootInterpolator(1.25f))
                 .start()
-            animateDim(0f, 0.55f, 260L, v)
+        } else {
+            b.scaleX = 1f
+            b.scaleY = 1f
+            b.alpha = 1f
         }
     }
 
-    // Arkadaki kararma (dim) yumuşakça belirir / kaybolur
-    private fun animateDim(from: Float, to: Float, durationMs: Long, view: View) {
-        dimAnimator?.cancel()
-        dimAnimator = ValueAnimator.ofFloat(from, to).apply {
-            duration = durationMs
-            addUpdateListener { a ->
-                if (!view.isAttachedToWindow) {
-                    a.cancel()
-                } else {
-                    expandedParams.dimAmount = a.animatedValue as Float
-                    try {
-                        windowManager.updateViewLayout(view, expandedParams)
-                    } catch (_: Exception) {}
-                }
-            }
-            start()
+    // Sohbet penceresi balonun bulunduğu yerden büyüyerek açılır
+    private fun playOpenAnimation(wrapper: View, content: View, scrim: View) {
+        wrapper.doOnLayout { w ->
+            val loc = IntArray(2)
+            w.getLocationOnScreen(loc)
+            content.pivotX = (bubbleCenterX - loc[0]).coerceIn(0f, content.width.toFloat())
+            content.pivotY = (bubbleCenterY - loc[1]).coerceIn(0f, content.height.toFloat())
+            content.scaleX = 0.12f
+            content.scaleY = 0.12f
+            content.alpha = 0f
+
+            content.animate().cancel()
+            content.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(250L)
+                .setInterpolator(DecelerateInterpolator(1.6f))
+                .start()
+
+            scrim.animate().cancel()
+            scrim.animate()
+                .alpha(1f)
+                .setDuration(250L)
+                .start()
         }
     }
 
@@ -1556,20 +1643,20 @@ class BubbleService : NotificationListenerService() {
         ySpring?.cancel()
         xSpring = null
         ySpring = null
-        dimAnimator?.cancel()
-        dimAnimator = null
         closeAnimator?.cancel()
         closeAnimator = null
 
-        chatWindowHolder?.rootOverlay?.let {
+        expandedRootWrapper?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
+        expandedRootWrapper = null
+        dimScrimView = null
         chatWindowHolder = null
 
-        closingOverlay?.let {
+        closingWrapper?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
         }
-        closingOverlay = null
+        closingWrapper = null
 
         bubbleView?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
