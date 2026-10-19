@@ -1,6 +1,8 @@
 package com.selim.superbubble
 
 import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.ActivityOptions
 import android.app.Notification
@@ -153,6 +155,7 @@ class BubbleService : NotificationListenerService() {
     private var bubbleCenterY = 0f
     private var closingOverlay: View? = null
     private var dimAnimator: ValueAnimator? = null
+    private var closeAnimator: ValueAnimator? = null
 
     // Açık Sohbet Penceresi
     private var chatWindowHolder: ChatWindowHolder? = null
@@ -1454,47 +1457,53 @@ class BubbleService : NotificationListenerService() {
         val overlay = chatWindowHolder?.rootOverlay
         chatWindowHolder = null
 
-        val finish: () -> Unit = {
-            if (overlay != null) {
-                try { windowManager.removeView(overlay) } catch (_: Exception) {}
-            }
-            if (closingOverlay === overlay) closingOverlay = null
-            if (!isExpanded) {
-                val b = bubbleView
-                if (b != null) {
-                    // Balon küçükten yaylanarak geri belirir
-                    b.visibility = View.VISIBLE
-                    b.scaleX = 0.7f
-                    b.scaleY = 0.7f
-                    b.animate().cancel()
-                    b.animate()
-                        .scaleX(1f)
-                        .scaleY(1f)
-                        .setDuration(220L)
-                        .setInterpolator(OvershootInterpolator(2f))
-                        .start()
-                }
-                activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
-            }
-        }
+        // Balonu hemen göster. Sohbet küçülürken altından balon görünür; böylece sohbet
+        // kaybolup balon sonradan belirirken oluşan boşluk (titreme) olmaz.
+        showBubbleAgain()
 
-        if (!animated || overlay == null || !overlay.isAttachedToWindow) {
-            finish()
+        if (overlay == null) return
+        if (!animated || !overlay.isAttachedToWindow) {
+            try { windowManager.removeView(overlay) } catch (_: Exception) {}
             return
         }
 
-        // Sohbet küçülerek balonun içine geri çekilir
+        // Sohbet balonun içine doğru küçülür; solma sadece son kısımda olur
         closingOverlay = overlay
         overlay.animate().cancel()
-        overlay.animate()
-            .alpha(0f)
-            .scaleX(0.15f)
-            .scaleY(0.15f)
-            .setDuration(200L)
-            .setInterpolator(AccelerateInterpolator(1.4f))
-            .withEndAction { finish() }
-            .start()
-        animateDim(0.55f, 0f, 200L, overlay)
+        val startScale = overlay.scaleX
+        val startAlpha = overlay.alpha
+        closeAnimator?.cancel()
+        closeAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 220L
+            interpolator = AccelerateInterpolator(1.4f)
+            addUpdateListener { a ->
+                val p = a.animatedValue as Float
+                val sc = startScale + (0.15f - startScale) * p
+                overlay.scaleX = sc
+                overlay.scaleY = sc
+                val fade = ((p - 0.6f) / 0.4f).coerceIn(0f, 1f)
+                overlay.alpha = startAlpha * (1f - fade)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    try { windowManager.removeView(overlay) } catch (_: Exception) {}
+                    if (closingOverlay === overlay) closingOverlay = null
+                }
+            })
+            start()
+        }
+        animateDim(0.55f, 0f, 220L, overlay)
+    }
+
+    // Balonu tam boyutta, hemen görünür yapar
+    private fun showBubbleAgain() {
+        val b = bubbleView ?: return
+        b.animate().cancel()
+        b.scaleX = 1f
+        b.scaleY = 1f
+        b.alpha = 1f
+        b.visibility = View.VISIBLE
+        activeSessions[activeChatKey]?.let { refreshBubbleAppearance(it) }
     }
 
     // Sohbet penceresi balonun bulunduğu yerden büyüyerek açılır
@@ -1549,6 +1558,8 @@ class BubbleService : NotificationListenerService() {
         ySpring = null
         dimAnimator?.cancel()
         dimAnimator = null
+        closeAnimator?.cancel()
+        closeAnimator = null
 
         chatWindowHolder?.rootOverlay?.let {
             try { windowManager.removeView(it) } catch (_: Exception) {}
